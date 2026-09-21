@@ -15,7 +15,6 @@ return new class extends Migration
             $table->id();
             $table->string('nombre_completo');
             $table->string('nombre_usuario')->unique();
-            $table->string('email')->unique();
             $table->string('contrasena');
             $table->string('rol');
             $table->boolean('estado')->default(true);
