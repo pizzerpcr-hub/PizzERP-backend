@@ -2,31 +2,55 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
-use Database\Factories\UserFactory;
-use Illuminate\Database\Eloquent\Attributes\Fillable;
-use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Sanctum\HasApiTokens;
 
-#[Fillable(['name', 'email', 'password'])]
-#[Hidden(['password', 'remember_token'])]
 class User extends Authenticatable
 {
-    /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable;
+    use HasApiTokens, HasFactory, Notifiable;
 
-    /**
-     * Get the attributes that should be cast.
-     *
-     * @return array<string, string>
-     */
+    protected $table = 'usuarios';
+
+    protected $primaryKey = 'id_usuario';
+
+    protected $fillable = [
+        'nombre_completo',
+        'nombre_usuario',
+        'contrasena_hash',
+        'rol',
+        'estado',
+        'intentos_fallidos',
+        'bloqueado_hasta',
+    ];
+
+    protected $hidden = [
+        'contrasena_hash',
+        'remember_token',
+    ];
+
     protected function casts(): array
     {
         return [
-            'email_verified_at' => 'datetime',
-            'password' => 'hashed',
+            'contrasena_hash' => 'hashed',
+            'intentos_fallidos' => 'integer',
+            'bloqueado_hasta' => 'datetime',
         ];
+    }
+
+    public function getAuthPasswordName(): string
+    {
+        return 'contrasena_hash';
+    }
+
+    public function bitacoras(): HasMany
+    {
+        return $this->hasMany(
+            Bitacora::class,
+            'id_usuario',
+            'id_usuario'
+        );
     }
 }
