@@ -14,22 +14,38 @@ return new class extends Migration
         });
 
         DB::statement(
-            'ALTER TABLE usuarios RENAME CONSTRAINT users_pkey TO usuarios_pkey'
+            'ALTER TABLE usuarios
+            RENAME CONSTRAINT users_pkey TO usuarios_pkey'
         );
 
         DB::statement(
-            'ALTER SEQUENCE users_id_seq RENAME TO usuarios_id_usuario_seq'
+            'ALTER TABLE usuarios
+            RENAME CONSTRAINT users_nombre_usuario_unique
+            TO usuarios_nombre_usuario_unique'
+        );
+
+        DB::statement(
+            'ALTER SEQUENCE users_id_seq
+            RENAME TO usuarios_id_usuario_seq'
         );
     }
 
     public function down(): void
     {
         DB::statement(
-            'ALTER TABLE usuarios RENAME CONSTRAINT usuarios_pkey TO users_pkey'
+            'ALTER TABLE usuarios
+            RENAME CONSTRAINT usuarios_pkey TO users_pkey'
         );
 
         DB::statement(
-            'ALTER SEQUENCE usuarios_id_usuario_seq RENAME TO users_id_seq'
+            'ALTER TABLE usuarios
+            RENAME CONSTRAINT usuarios_nombre_usuario_unique
+            TO users_nombre_usuario_unique'
+        );
+
+        DB::statement(
+            'ALTER SEQUENCE usuarios_id_usuario_seq
+            RENAME TO users_id_seq'
         );
 
         Schema::table('usuarios', function (Blueprint $table) {
