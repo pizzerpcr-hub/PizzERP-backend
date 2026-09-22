@@ -16,4 +16,7 @@ Route::middleware('auth:sanctum')->group(function (): void {
 
     Route::post('/users', [UserController::class, 'store'])
         ->name('users.store');
+
+    Route::get('/users', [UserController::class, 'index'])
+        ->name('users.index');
 });

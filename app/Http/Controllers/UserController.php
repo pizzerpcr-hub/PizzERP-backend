@@ -26,7 +26,7 @@ class UserController extends Controller
             'nombre_completo' => trim(
                 (string) $request->input('nombre_completo')
             ),
-            'nombre_usuario' => mb_strtolower(trim(
+            'nombre_usuario' => mb_strtoupper(trim(
                 (string) $request->input('nombre_usuario')
             )),
             'rol' => mb_strtoupper(trim(
@@ -109,4 +109,53 @@ class UserController extends Controller
             ],
         ], 201);
     }
+
+
+    public function index(Request $request): JsonResponse
+    {
+        $authenticatedUser = $request->user();
+
+        if (
+            mb_strtoupper($authenticatedUser->rol)
+            !== 'ADMINISTRADOR'
+        ) {
+            return response()->json([
+                'message' => 'No tiene permiso para listar usuarios.',
+            ], 403);
+        }
+
+        $users = User::all();
+
+        return response()->json([
+            'usuarios' => $users->map(function ($user) {
+                return [
+                    'id_usuario' => $user->id_usuario,
+                    'nombre_completo' => $user->nombre_completo,
+                    'nombre_usuario' => $user->nombre_usuario,
+                    'rol' => $user->rol,
+                    'estado' => $user->estado,
+                ];
+            }),
+        ]);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
