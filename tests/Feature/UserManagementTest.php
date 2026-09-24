@@ -67,6 +67,346 @@ class UserManagementTest extends TestCase
         parent::tearDown();
     }
 
+    public function test_login_failures_share_status_and_body_without_losing_internal_audits(): void
+    {
+        $wrongPasswordUser = User::factory()->create([
+            'nombre_usuario' => 'CLAVE.INCORRECTA',
+        ]);
+        $inactiveUser = User::factory()->inactive()->create([
+            'nombre_usuario' => 'CUENTA.INACTIVA',
+        ]);
+        $blockedUser = User::factory()->create([
+            'nombre_usuario' => 'CUENTA.BLOQUEADA',
+            'intentos_fallidos' => 5,
+            'bloqueado_hasta' => now()->addMinutes(5),
+        ]);
+
+        $missingResponse = $this->postJson('/api/login', [
+            'username' => 'NO.EXISTE',
+            'password' => 'Password123',
+        ]);
+        $wrongPasswordResponse = $this->postJson('/api/login', [
+            'username' => 'CLAVE.INCORRECTA',
+            'password' => 'WrongPassword456',
+        ]);
+        $inactiveResponse = $this->postJson('/api/login', [
+            'username' => 'CUENTA.INACTIVA',
+            'password' => 'Password123',
+        ]);
+        $blockedResponse = $this->postJson('/api/login', [
+            'username' => 'CUENTA.BLOQUEADA',
+            'password' => 'Password123',
+        ]);
+
+        foreach ([$missingResponse, $wrongPasswordResponse, $inactiveResponse, $blockedResponse] as $response) {
+            $response
+                ->assertUnauthorized()
+                ->assertExactJson([
+                    'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+                ]);
+
+            $this->assertSame($missingResponse->status(), $response->status());
+            $this->assertSame($missingResponse->json(), $response->json());
+        }
+
+        $this->assertSame(1, $wrongPasswordUser->fresh()->intentos_fallidos);
+        $this->assertSame(0, $inactiveUser->fresh()->intentos_fallidos);
+        $this->assertSame(5, $blockedUser->fresh()->intentos_fallidos);
+        $this->assertDatabaseCount('bitacoras', 3);
+        $this->assertDatabaseHas('bitacoras', [
+            'id_usuario' => $wrongPasswordUser->id_usuario,
+            'descripcion_movimiento' => 'Intento de inicio de sesión fallido.',
+        ]);
+        $this->assertDatabaseHas('bitacoras', [
+            'id_usuario' => $inactiveUser->id_usuario,
+            'descripcion_movimiento' => 'Intento de acceso de un usuario inactivo.',
+        ]);
+        $this->assertDatabaseHas('bitacoras', [
+            'id_usuario' => $blockedUser->id_usuario,
+            'descripcion_movimiento' => 'Intento de acceso mientras la cuenta estaba bloqueada.',
+        ]);
+    }
+
+    public function test_login_still_blocks_after_five_failures_without_exposing_lock_details(): void
+    {
+        $user = User::factory()->create([
+            'nombre_usuario' => 'QUINTO.INTENTO',
+            'intentos_fallidos' => 4,
+        ]);
+
+        $referenceResponse = $this->postJson('/api/login', [
+            'username' => 'NO.EXISTE',
+            'password' => 'Password123',
+        ]);
+        $fifthAttemptResponse = $this->postJson('/api/login', [
+            'username' => 'QUINTO.INTENTO',
+            'password' => 'WrongPassword456',
+        ]);
+        $blockedResponse = $this->postJson('/api/login', [
+            'username' => 'QUINTO.INTENTO',
+            'password' => 'Password123',
+        ]);
+
+        foreach ([$fifthAttemptResponse, $blockedResponse] as $response) {
+            $response->assertUnauthorized();
+            $this->assertSame($referenceResponse->status(), $response->status());
+            $this->assertSame($referenceResponse->json(), $response->json());
+        }
+
+        $user->refresh();
+        $this->assertSame(5, $user->intentos_fallidos);
+        $this->assertTrue($user->bloqueado_hasta->isFuture());
+        $this->assertDatabaseCount('bitacoras', 2);
+        $this->assertDatabaseHas('bitacoras', [
+            'id_usuario' => $user->id_usuario,
+            'descripcion_movimiento' => 'Cuenta bloqueada por intentos fallidos.',
+        ]);
+    }
+
+    public function test_successful_login_keeps_session_response_and_resets_failed_attempts(): void
+    {
+        $user = User::factory()->create([
+            'nombre_usuario' => 'INGRESO.CORRECTO',
+            'intentos_fallidos' => 2,
+        ]);
+
+        config()->set('sanctum.stateful', ['localhost']);
+
+        $this->withHeaders([
+            'Origin' => 'http://localhost',
+            'Referer' => 'http://localhost/',
+        ])->postJson('/api/login', [
+            'username' => 'ingreso.correcto',
+            'password' => 'Password123',
+        ])
+            ->assertOk()
+            ->assertJsonPath('usuario.id_usuario', $user->id_usuario)
+            ->assertJsonPath('usuario.nombre_usuario', 'INGRESO.CORRECTO');
+
+        $user->refresh();
+        $this->assertSame(0, $user->intentos_fallidos);
+        $this->assertNull($user->bloqueado_hasta);
+        $this->assertDatabaseHas('bitacoras', [
+            'id_usuario' => $user->id_usuario,
+            'descripcion_movimiento' => 'Inicio de sesión exitoso.',
+        ]);
+    }
+
+    public function test_five_failures_across_usernames_block_only_the_same_ip_before_user_lookup(): void
+    {
+        $firstUser = User::factory()->create([
+            'nombre_usuario' => 'PRIMER.USUARIO',
+        ]);
+        User::factory()->create([
+            'nombre_usuario' => 'SEGUNDO.USUARIO',
+        ]);
+
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeaders([
+            'Origin' => 'http://localhost',
+            'Referer' => 'http://localhost/',
+        ]);
+
+        foreach (['NO.EXISTE', 'PRIMER.USUARIO', 'OTRO.INEXISTENTE', 'SEGUNDO.USUARIO', 'TERCERO.INEXISTENTE'] as $username) {
+            $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+                ->postJson('/api/login', [
+                    'username' => $username,
+                    'password' => 'WrongPassword456',
+                ])
+                ->assertUnauthorized()
+                ->assertExactJson([
+                    'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+                ]);
+        }
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $blockedResponse = $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+                ->postJson('/api/login', [
+                    'username' => 'PRIMER.USUARIO',
+                    'password' => 'Password123',
+                ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $blockedResponse
+            ->assertUnauthorized()
+            ->assertExactJson([
+                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+            ]);
+        $this->assertCount(0, $queries);
+        $this->assertDatabaseCount('bitacoras', 2);
+
+        $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.11'])
+            ->postJson('/api/login', [
+                'username' => 'PRIMER.USUARIO',
+                'password' => 'Password123',
+            ])
+            ->assertOk()
+            ->assertJsonPath('usuario.id_usuario', $firstUser->id_usuario);
+
+        $this->assertDatabaseCount('bitacoras', 3);
+    }
+
+    public function test_account_failed_attempts_persist_when_request_ip_changes(): void
+    {
+        $user = User::factory()->create([
+            'nombre_usuario' => 'CUENTA.COMPARTIDA',
+        ]);
+
+        foreach (['192.0.2.20', '192.0.2.21', '192.0.2.20', '192.0.2.21', '192.0.2.22'] as $ip) {
+            $this->withServerVariables(['REMOTE_ADDR' => $ip])
+                ->postJson('/api/login', [
+                    'username' => 'CUENTA.COMPARTIDA',
+                    'password' => 'WrongPassword456',
+                ])
+                ->assertUnauthorized();
+        }
+
+        $user->refresh();
+        $this->assertSame(5, $user->intentos_fallidos);
+        $this->assertTrue($user->bloqueado_hasta->isFuture());
+        $this->assertDatabaseCount('bitacoras', 5);
+
+        $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.23'])
+            ->postJson('/api/login', [
+                'username' => 'CUENTA.COMPARTIDA',
+                'password' => 'Password123',
+            ])
+            ->assertUnauthorized()
+            ->assertExactJson([
+                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+            ]);
+
+        $this->assertSame(5, $user->fresh()->intentos_fallidos);
+        $this->assertDatabaseCount('bitacoras', 6);
+    }
+
+    public function test_ip_limit_expires_after_five_minutes_and_valid_login_succeeds(): void
+    {
+        $this->freezeTime();
+
+        $user = User::factory()->create([
+            'nombre_usuario' => 'DESPUES.DEL.PLAZO',
+        ]);
+
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeaders([
+            'Origin' => 'http://localhost',
+            'Referer' => 'http://localhost/',
+        ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.30']);
+
+        for ($attempt = 1; $attempt <= 5; $attempt++) {
+            $this->postJson('/api/login', [
+                'username' => 'NO.EXISTE',
+                'password' => 'Password123',
+            ])->assertUnauthorized();
+        }
+
+        $this->postJson('/api/login', [
+            'username' => 'DESPUES.DEL.PLAZO',
+            'password' => 'Password123',
+        ])->assertUnauthorized();
+
+        $this->assertDatabaseCount('bitacoras', 0);
+
+        $this->travel(301)->seconds();
+
+        $this->postJson('/api/login', [
+            'username' => 'DESPUES.DEL.PLAZO',
+            'password' => 'Password123',
+        ])
+            ->assertOk()
+            ->assertJsonPath('usuario.id_usuario', $user->id_usuario);
+
+        $this->assertDatabaseCount('bitacoras', 1);
+    }
+
+    public function test_forwarded_for_header_cannot_spoof_untrusted_ip_limit(): void
+    {
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.CABECERAS',
+        ]);
+
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeaders([
+            'Origin' => 'http://localhost',
+            'Referer' => 'http://localhost/',
+        ]);
+
+        for ($attempt = 1; $attempt <= 5; $attempt++) {
+            $this->withHeaders(['X-Forwarded-For' => "198.51.100.{$attempt}"])
+                ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
+                ->postJson('/api/login', [
+                    'username' => 'NO.EXISTE',
+                    'password' => 'Password123',
+                ])
+                ->assertUnauthorized();
+        }
+
+        $this->withHeaders(['X-Forwarded-For' => '198.51.100.6'])
+            ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
+            ->postJson('/api/login', [
+                'username' => 'USUARIO.CABECERAS',
+                'password' => 'Password123',
+            ])
+            ->assertUnauthorized()
+            ->assertExactJson([
+                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+            ]);
+
+        $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.41'])
+            ->postJson('/api/login', [
+                'username' => 'USUARIO.CABECERAS',
+                'password' => 'Password123',
+            ])
+            ->assertOk()
+            ->assertJsonPath('usuario.id_usuario', $user->id_usuario);
+    }
+
+    public function test_only_configured_proxy_ip_can_supply_client_ip_for_login_limit(): void
+    {
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.PROXY',
+        ]);
+
+        config()->set('trustedproxy.proxies', ['192.0.2.50']);
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeaders([
+            'Origin' => 'http://localhost',
+            'Referer' => 'http://localhost/',
+        ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.50']);
+
+        for ($attempt = 1; $attempt <= 5; $attempt++) {
+            $this->withHeader('X-Forwarded-For', '198.51.100.50')
+                ->postJson('/api/login', [
+                    'username' => 'NO.EXISTE',
+                    'password' => 'Password123',
+                ])
+                ->assertUnauthorized();
+        }
+
+        $this->withHeader('X-Forwarded-For', '198.51.100.50')
+            ->postJson('/api/login', [
+                'username' => 'USUARIO.PROXY',
+                'password' => 'Password123',
+            ])
+            ->assertUnauthorized();
+
+        $this->withHeader('X-Forwarded-For', '198.51.100.51')
+            ->postJson('/api/login', [
+                'username' => 'USUARIO.PROXY',
+                'password' => 'Password123',
+            ])
+            ->assertOk()
+            ->assertJsonPath('usuario.id_usuario', $user->id_usuario);
+    }
+
     public function test_inactive_user_cannot_retrieve_authenticated_user(): void
     {
         $inactiveUser = User::factory()->inactive()->create();
@@ -161,6 +501,216 @@ class UserManagementTest extends TestCase
         $this->assertStringContainsString('rol', $audit->motivo);
     }
 
+    public function test_update_returns_404_when_user_does_not_exist(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson('/api/users/999999', [
+            'nombre_completo' => 'Usuario Inexistente',
+            'nombre_usuario' => 'USUARIO.INEXISTENTE',
+            'rol' => 'CAJA',
+        ])->assertNotFound();
+
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_missing_user_returns_404_before_update_validation(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson('/api/users/999999', [
+            'rol' => 'DESCONOCIDO',
+        ])->assertNotFound();
+
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_update_skips_unique_query_when_normalized_username_is_unchanged(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $response = $this->patchJson("/api/users/{$user->id_usuario}", [
+                'nombre_completo' => 'Nombre actualizado',
+                'nombre_usuario' => '  usuario.editable  ',
+                'rol' => $user->rol,
+            ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.EDITABLE')
+            ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
+
+        $this->assertCount(4, $queries);
+        $this->assertCount(0, array_filter(
+            $queries,
+            fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
+        ));
+        $this->assertDatabaseHas('usuarios', [
+            'id_usuario' => $user->id_usuario,
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+            'nombre_completo' => 'Nombre actualizado',
+        ]);
+        $this->assertDatabaseCount('bitacoras', 1);
+    }
+
+    public function test_update_checks_unique_query_when_normalized_username_changes(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $response = $this->patchJson("/api/users/{$user->id_usuario}", [
+                'nombre_completo' => 'Nombre actualizado',
+                'nombre_usuario' => '  usuario.nuevo  ',
+                'rol' => $user->rol,
+            ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.NUEVO')
+            ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
+
+        $this->assertCount(5, $queries);
+        $this->assertCount(1, array_filter(
+            $queries,
+            fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
+        ));
+        $this->assertDatabaseHas('usuarios', [
+            'id_usuario' => $user->id_usuario,
+            'nombre_usuario' => 'USUARIO.NUEVO',
+            'nombre_completo' => 'Nombre actualizado',
+        ]);
+        $this->assertDatabaseCount('bitacoras', 1);
+    }
+
+    public function test_update_rejects_username_used_by_another_user(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+        ]);
+        User::factory()->create([
+            'nombre_usuario' => 'USUARIO.OCUPADO',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson("/api/users/{$user->id_usuario}", [
+            'nombre_completo' => $user->nombre_completo,
+            'nombre_usuario' => 'usuario.ocupado',
+            'rol' => $user->rol,
+        ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('nombre_usuario')
+            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario ya está registrado.');
+
+        $this->assertSame('USUARIO.EDITABLE', $user->fresh()->nombre_usuario);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_update_rejects_overlong_username_without_unique_query(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $response = $this->patchJson("/api/users/{$user->id_usuario}", [
+                'nombre_completo' => 'Nombre actualizado',
+                'nombre_usuario' => str_repeat('A', 51),
+                'rol' => $user->rol,
+            ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $response
+            ->assertUnprocessable()
+            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario no puede superar 50 caracteres.');
+
+        $this->assertNotEmpty($queries);
+        $this->assertCount(0, array_filter(
+            $queries,
+            fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
+        ));
+        $this->assertSame('USUARIO.EDITABLE', $user->fresh()->nombre_usuario);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_update_rejects_invalid_role_without_locking_administrators(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.EDITABLE',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $response = $this->patchJson("/api/users/{$user->id_usuario}", [
+                'nombre_completo' => $user->nombre_completo,
+                'nombre_usuario' => $user->nombre_usuario,
+                'rol' => 'DESCONOCIDO',
+            ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $response
+            ->assertUnprocessable()
+            ->assertJsonPath('errors.rol.0', 'El rol seleccionado no es válido.');
+
+        $this->assertCount(1, array_filter(
+            $queries,
+            fn (array $query): bool => str_starts_with(strtolower($query['query']), 'select ')
+        ));
+        $this->assertSame('CAJA', $user->fresh()->rol);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
     public function test_non_administrator_cannot_update_user(): void
     {
         $cashier = User::factory()->create();
@@ -180,6 +730,29 @@ class UserManagementTest extends TestCase
             'id_usuario' => $user->id_usuario,
             'nombre_usuario' => 'USUARIO.PROTEGIDO',
         ]);
+    }
+
+    public function test_inactive_administrator_cannot_update_user(): void
+    {
+        $administrator = User::factory()->administrator()->inactive()->create();
+        $user = User::factory()->create([
+            'nombre_usuario' => 'USUARIO.PROTEGIDO',
+        ]);
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson("/api/users/{$user->id_usuario}", [
+            'nombre_completo' => 'Intento no autorizado',
+            'nombre_usuario' => 'INTENTO.NO.AUTORIZADO',
+            'rol' => 'TI',
+        ])
+            ->assertForbidden()
+            ->assertExactJson([
+                'message' => 'El usuario se encuentra inactivo.',
+            ]);
+
+        $this->assertSame('USUARIO.PROTEGIDO', $user->fresh()->nombre_usuario);
+        $this->assertDatabaseCount('bitacoras', 0);
     }
 
     public function test_empty_password_preserves_current_hash(): void
@@ -311,11 +884,40 @@ class UserManagementTest extends TestCase
         $this->assertStringNotContainsString($updatedHash, $audit->motivo);
     }
 
+    public function test_status_update_returns_404_when_user_does_not_exist(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson('/api/users/999999/estado', [
+            'estado' => 'INACTIVO',
+        ])->assertNotFound();
+
+        $this->assertDatabaseCount('bitacoras', 0);
+        $this->assertSame('ACTIVO', $administrator->fresh()->estado);
+    }
+
+    public function test_missing_user_returns_404_before_status_validation(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+
+        Sanctum::actingAs($administrator);
+
+        $this->patchJson('/api/users/999999/estado', [
+            'estado' => 'DESCONOCIDO',
+        ])->assertNotFound();
+
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
     public function test_user_can_be_deactivated_and_reactivated(): void
     {
         $administrator = User::factory()->administrator()->create();
         $user = User::factory()->create([
             'nombre_usuario' => 'ESTADO.USUARIO',
+            'intentos_fallidos' => 5,
+            'bloqueado_hasta' => now()->addMinutes(5),
         ]);
 
         Sanctum::actingAs($administrator);
@@ -332,10 +934,9 @@ class UserManagementTest extends TestCase
             $deactivateResponse->json('usuario')
         );
 
-        $user->refresh()->forceFill([
-            'intentos_fallidos' => 5,
-            'bloqueado_hasta' => now()->addMinutes(5),
-        ])->save();
+        $user->refresh();
+        $this->assertSame(5, $user->intentos_fallidos);
+        $this->assertNotNull($user->bloqueado_hasta);
 
         $reactivateResponse = $this->patchJson(
             "/api/users/{$user->id_usuario}/estado",
@@ -377,6 +978,7 @@ class UserManagementTest extends TestCase
             ->assertJsonValidationErrors('estado');
 
         $this->assertSame('ACTIVO', $administrator->fresh()->estado);
+        $this->assertDatabaseCount('bitacoras', 0);
     }
 
     public function test_last_active_administrator_cannot_be_deactivated(): void
@@ -404,6 +1006,7 @@ class UserManagementTest extends TestCase
             'ACTIVO',
             $lastActiveAdministrator->fresh()->estado
         );
+        $this->assertDatabaseCount('bitacoras', 0);
     }
 
     public function test_last_active_administrator_cannot_change_role(): void
@@ -437,6 +1040,7 @@ class UserManagementTest extends TestCase
             'ADMINISTRADOR',
             $lastActiveAdministrator->fresh()->rol
         );
+        $this->assertDatabaseCount('bitacoras', 0);
     }
 
     public function test_creation_records_actor_and_affected_user_in_audit(): void
@@ -496,6 +1100,40 @@ class UserManagementTest extends TestCase
         $this->assertDatabaseMissing('usuarios', [
             'nombre_usuario' => 'ROL.INVALIDO',
         ]);
+    }
+
+    public function test_creation_rejects_overlong_username_without_unique_query(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+
+        Sanctum::actingAs($administrator);
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+
+        try {
+            $response = $this->postJson('/api/users', [
+                'nombre_completo' => 'Nuevo Usuario',
+                'nombre_usuario' => str_repeat('A', 51),
+                'contrasena' => 'Password123',
+                'rol' => 'CAJA',
+            ]);
+            $queries = DB::connection()->getQueryLog();
+        } finally {
+            DB::connection()->disableQueryLog();
+            DB::connection()->flushQueryLog();
+        }
+
+        $response
+            ->assertUnprocessable()
+            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario no puede superar 50 caracteres.');
+
+        $this->assertCount(0, array_filter(
+            $queries,
+            fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
+        ));
+        $this->assertDatabaseCount('usuarios', 1);
+        $this->assertDatabaseCount('bitacoras', 0);
     }
 
     public function test_listing_is_ordered_and_contains_only_public_columns(): void

@@ -61,6 +61,7 @@ class UserController extends Controller
                 'max:100',
             ],
             'nombre_usuario' => [
+                'bail',
                 'required',
                 'string',
                 'max:50',
@@ -128,9 +129,10 @@ class UserController extends Controller
         ]);
     }
 
-    public function update(Request $request, User $user): JsonResponse
+    public function update(Request $request): JsonResponse
     {
         $administrator = $this->authenticatedAdministrator($request);
+        $userId = $request->route('user');
 
         $request->merge([
             'nombre_completo' => trim(
@@ -144,53 +146,56 @@ class UserController extends Controller
             )),
         ]);
 
-        $data = $request->validate([
-            'nombre_completo' => [
-                'required',
-                'string',
-                'max:100',
-            ],
-            'nombre_usuario' => [
-                'required',
-                'string',
-                'max:50',
-                Rule::unique('usuarios', 'nombre_usuario')
-                    ->ignore($user->id_usuario, 'id_usuario'),
-            ],
-            'rol' => [
-                'required',
-                Rule::in(self::ALLOWED_ROLES),
-            ],
-            'contrasena' => [
-                'nullable',
-                'string',
-                Password::min(8)
-                    ->letters()
-                    ->numbers(),
-            ],
-            'estado' => ['prohibited'],
-        ], $this->validationMessages());
-
-        $passwordWasProvided = isset($data['contrasena'])
-            && $data['contrasena'] !== '';
-
         $updatedUser = DB::transaction(function () use (
             $administrator,
-            $data,
-            $passwordWasProvided,
-            $user
+            $request,
+            $userId
         ): User {
             $activeAdministratorCount = null;
 
-            if ($data['rol'] !== self::ADMINISTRATOR_ROLE) {
+            if (
+                $request->input('rol') !== self::ADMINISTRATOR_ROLE
+                && in_array($request->input('rol'), self::ALLOWED_ROLES, true)
+            ) {
                 $activeAdministratorCount =
                     $this->lockAndCountActiveAdministrators();
             }
 
             $lockedUser = User::query()
-                ->whereKey($user->getKey())
+                ->whereKey($userId)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $usernameRules = ['bail', 'required', 'string', 'max:50'];
+
+            if ($request->input('nombre_usuario') !== $lockedUser->nombre_usuario) {
+                $usernameRules[] = Rule::unique('usuarios', 'nombre_usuario')
+                    ->ignore($lockedUser->id_usuario, 'id_usuario');
+            }
+
+            $data = $request->validate([
+                'nombre_completo' => [
+                    'required',
+                    'string',
+                    'max:100',
+                ],
+                'nombre_usuario' => $usernameRules,
+                'rol' => [
+                    'required',
+                    Rule::in(self::ALLOWED_ROLES),
+                ],
+                'contrasena' => [
+                    'nullable',
+                    'string',
+                    Password::min(8)
+                        ->letters()
+                        ->numbers(),
+                ],
+                'estado' => ['prohibited'],
+            ], $this->validationMessages());
+
+            $passwordWasProvided = isset($data['contrasena'])
+                && $data['contrasena'] !== '';
 
             if (
                 $lockedUser->rol === self::ADMINISTRATOR_ROLE
@@ -237,11 +242,10 @@ class UserController extends Controller
         ]);
     }
 
-    public function updateStatus(
-        Request $request,
-        User $user
-    ): JsonResponse {
+    public function updateStatus(Request $request): JsonResponse
+    {
         $administrator = $this->authenticatedAdministrator($request);
+        $userId = $request->route('user');
 
         $request->merge([
             'estado' => mb_strtoupper(trim(
@@ -249,16 +253,10 @@ class UserController extends Controller
             )),
         ]);
 
-        $data = $request->validate([
-            'estado' => [
-                'required',
-                Rule::in(self::ALLOWED_STATUSES),
-            ],
-        ], $this->validationMessages());
-
         if (
-            $data['estado'] === 'INACTIVO'
-            && $administrator->is($user)
+            $request->input('estado') === 'INACTIVO'
+            && ctype_digit((string) $userId)
+            && ltrim((string) $userId, '0') === (string) $administrator->getKey()
         ) {
             throw ValidationException::withMessages([
                 'estado' => 'No puede desactivar su propia cuenta.',
@@ -267,20 +265,36 @@ class UserController extends Controller
 
         $updatedUser = DB::transaction(function () use (
             $administrator,
-            $data,
-            $user
+            $request,
+            $userId
         ): User {
             $activeAdministratorCount = null;
 
-            if ($data['estado'] === 'INACTIVO') {
+            if ($request->input('estado') === 'INACTIVO') {
                 $activeAdministratorCount =
                     $this->lockAndCountActiveAdministrators();
             }
 
             $lockedUser = User::query()
-                ->whereKey($user->getKey())
+                ->whereKey($userId)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $data = $request->validate([
+                'estado' => [
+                    'required',
+                    Rule::in(self::ALLOWED_STATUSES),
+                ],
+            ], $this->validationMessages());
+
+            if (
+                $data['estado'] === 'INACTIVO'
+                && $administrator->is($lockedUser)
+            ) {
+                throw ValidationException::withMessages([
+                    'estado' => 'No puede desactivar su propia cuenta.',
+                ]);
+            }
 
             if (
                 $data['estado'] === 'INACTIVO'

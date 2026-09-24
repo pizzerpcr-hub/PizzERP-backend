@@ -6,11 +6,14 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Models\Bitacora;
 use App\Models\User;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\RateLimiter;
 
 class AuthController extends Controller
 {
@@ -18,8 +21,29 @@ class AuthController extends Controller
 
     private const LOCK_MINUTES = 5;
 
+    private const MAX_IP_FAILED_ATTEMPTS = 5;
+
+    private const IP_LIMIT_SECONDS = 300;
+
     public function login(LoginRequest $request): JsonResponse
     {
+        $ipLimitKey = 'login:ip:'.hash('sha256', (string) $request->ip());
+
+        try {
+            return Cache::store(config('cache.limiter'))
+                ->lock($ipLimitKey.':lock', 30)
+                ->block(10, fn (): JsonResponse => $this->attemptLogin($request, $ipLimitKey));
+        } catch (LockTimeoutException) {
+            return $this->failedLoginResponse();
+        }
+    }
+
+    private function attemptLogin(LoginRequest $request, string $ipLimitKey): JsonResponse
+    {
+        if (RateLimiter::tooManyAttempts($ipLimitKey, self::MAX_IP_FAILED_ATTEMPTS)) {
+            return $this->failedLoginResponse();
+        }
+
         $data = $request->validated();
         $username = mb_strtolower(trim($data['username']));
 
@@ -28,10 +52,7 @@ class AuthController extends Controller
             ->first();
 
         if (! $user) {
-            return response()->json([
-                'message' => 'Usuario o contraseña incorrectos.',
-                'intentos_restantes' => null,
-            ], 401);
+            return $this->failedLoginResponse($ipLimitKey);
         }
 
         if (
@@ -45,20 +66,13 @@ class AuthController extends Controller
                 'La cuenta permanece bloqueada temporalmente.'
             );
 
-            return $this->blockedResponse($user->bloqueado_hasta);
+            return $this->failedLoginResponse($ipLimitKey);
         }
 
         if (! Hash::check($data['password'], $user->contrasena_hash)) {
-            $result = $this->registerFailedAttempt($user);
+            $this->registerFailedAttempt($user);
 
-            if ($result['status'] === 'blocked') {
-                return $this->blockedResponse($result['blocked_until']);
-            }
-
-            return response()->json([
-                'message' => 'Usuario o contraseña incorrectos.',
-                'intentos_restantes' => $result['remaining_attempts'],
-            ], 401);
+            return $this->failedLoginResponse($ipLimitKey);
         }
 
         if (mb_strtoupper($user->estado) !== 'ACTIVO') {
@@ -69,9 +83,7 @@ class AuthController extends Controller
                 'El estado del usuario no permite iniciar sesión.'
             );
 
-            return response()->json([
-                'message' => 'El usuario se encuentra inactivo.',
-            ], 403);
+            return $this->failedLoginResponse($ipLimitKey);
         }
 
         if (
@@ -137,9 +149,9 @@ class AuthController extends Controller
         ]);
     }
 
-    private function registerFailedAttempt(User $user): array
+    private function registerFailedAttempt(User $user): void
     {
-        return DB::transaction(function () use ($user): array {
+        DB::transaction(function () use ($user): void {
             $lockedUser = User::query()
                 ->whereKey($user->getKey())
                 ->lockForUpdate()
@@ -156,10 +168,7 @@ class AuthController extends Controller
                     'La cuenta permanece bloqueada temporalmente.'
                 );
 
-                return [
-                    'status' => 'blocked',
-                    'blocked_until' => $lockedUser->bloqueado_hasta,
-                ];
+                return;
             }
 
             if (
@@ -191,10 +200,7 @@ class AuthController extends Controller
                     'Se alcanzó el máximo de 5 intentos fallidos.'
                 );
 
-                return [
-                    'status' => 'blocked',
-                    'blocked_until' => $lockedUser->bloqueado_hasta,
-                ];
+                return;
             }
 
             $lockedUser->save();
@@ -206,22 +212,18 @@ class AuthController extends Controller
                 'La contraseña ingresada es incorrecta.'
             );
 
-            return [
-                'status' => 'invalid_credentials',
-                'remaining_attempts' =>
-                    self::MAX_FAILED_ATTEMPTS
-                    - $lockedUser->intentos_fallidos,
-            ];
         });
     }
 
-    private function blockedResponse($blockedUntil): JsonResponse
+    private function failedLoginResponse(?string $ipLimitKey = null): JsonResponse
     {
+        if ($ipLimitKey !== null) {
+            RateLimiter::hit($ipLimitKey, self::IP_LIMIT_SECONDS);
+        }
+
         return response()->json([
-            'message' => 'La cuenta está bloqueada temporalmente.',
-            'bloqueado_hasta' => $blockedUntil->toIso8601String(),
-            'minutos_bloqueo' => self::LOCK_MINUTES,
-        ], 423);
+            'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+        ], 401);
     }
 
     private function recordAudit(
