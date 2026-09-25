@@ -10,6 +10,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 use Illuminate\Validation\ValidationException;
+use App\Events\UserChanged;
+use App\Events\UserCreated;
+use App\Events\UserStatus;
 
 class UserController extends Controller
 {
@@ -97,6 +100,8 @@ class UserController extends Controller
                 'intentos_fallidos' => 0,
                 'bloqueado_hasta' => null,
             ]);
+
+            broadcast(new UserCreated($user->toArray()));
 
             $this->recordAudit(
                 $administrator,
@@ -233,6 +238,9 @@ class UserController extends Controller
                 );
             }
 
+
+            broadcast(new UserChanged($lockedUser->fresh()->toArray()));
+
             return $lockedUser;
         });
 
@@ -326,7 +334,13 @@ class UserController extends Controller
                     "Estado del usuario {$lockedUser->nombre_usuario} (ID {$lockedUser->id_usuario}) actualizado.",
                     "Estado anterior: {$previousStatus}; estado nuevo: {$lockedUser->estado}."
                 );
+
+                broadcast(new UserStatus(
+                    $this->userPayload($lockedUser)
+                ));
             }
+
+            
 
             return $lockedUser;
         });
