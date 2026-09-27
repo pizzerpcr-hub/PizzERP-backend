@@ -2,19 +2,613 @@
 
 namespace Tests\Feature;
 
-use App\Http\Middleware\EnsureUserIsActive;
+use App\Events\UserChanged;
+use App\Events\UserCreated;
+use App\Events\UserStatus;
 use App\Models\Bitacora;
 use App\Models\User;
+use Illuminate\Broadcasting\Broadcasters\NullBroadcaster;
+use Illuminate\Broadcasting\BroadcastEvent;
+use Illuminate\Contracts\Broadcasting\Factory;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Broadcast;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Testing\TestResponse;
 use Laravel\Sanctum\Sanctum;
+use PHPUnit\Framework\Attributes\TestWith;
+use Pusher\Pusher;
 use RuntimeException;
 use Tests\TestCase;
 
 class UserManagementTest extends TestCase
 {
+    /** Opt-in integration test with real sockets subscribed before the channel was retired. */
+    #[TestWith(['TI', 'CAJA'])]
+    #[TestWith(['TI', 'COCINA'])]
+    #[TestWith(['ADMINISTRADOR', 'CAJA'])]
+    #[TestWith(['ADMINISTRADOR', 'COCINA'])]
+    #[TestWith(['TI', null])]
+    #[TestWith(['ADMINISTRADOR', null])]
+    public function test_existing_websockets_receive_no_user_events_after_channel_retirement(string $role, ?string $newRole): void
+    {
+        if (getenv('RUN_REVERB_DIAGNOSTIC') !== '1') {
+            $this->markTestSkipped('Opt-in diagnostic requires isolated Reverb on 127.0.0.1:18080 with test credentials.');
+        }
+        $this->configureBroadcastAuth();
+        config(['sanctum.stateful' => ['localhost']]);
+        config([
+            'broadcasting.connections.reverb.options' => [
+                'host' => '127.0.0.1', 'port' => 18080, 'scheme' => 'http', 'useTLS' => false,
+            ],
+        ]);
+        $pusher = new Pusher('test-key', 'test-secret', 'test-app', [
+            'host' => '127.0.0.1', 'port' => 18080, 'scheme' => 'http', 'useTLS' => false,
+        ]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $actor = User::factory()->administrator()->create();
+        $target = User::factory()->create(['rol' => $role]);
+        $cookieName = config('session.cookie');
+        $sessions = [];
+        foreach ([$actor, $target] as $user) {
+            auth()->forgetGuards();
+            $login = $this->withCookie($cookieName, '')->postJson('/api/login', [
+                'username' => $user->nombre_usuario, 'password' => 'Password123',
+            ])->assertOk();
+            $sessions[] = $login->getCookie($cookieName)->getValue();
+        }
+        $this->assertNotSame($sessions[0], $sessions[1]);
+        $clients = [];
+        try {
+            foreach ($sessions as $session) {
+                $process = proc_open(['node', base_path('tests/Support/reverb-probe.mjs')], [
+                    0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
+                ], $pipes, base_path());
+                $this->assertIsResource($process);
+                $clients[] = [$process, $pipes];
+                stream_set_timeout($pipes[1], 10);
+                $connected = json_decode((string) fgets($pipes[1]), true, flags: JSON_THROW_ON_ERROR);
+                $this->assertSame('pusher:connection_established', $connected['event']);
+                $socketId = json_decode($connected['data'], true)['socket_id'];
+                auth()->forgetGuards();
+                $this->withCookie($cookieName, $session)->postJson('/broadcasting/auth', [
+                    'socket_id' => $socketId, 'channel_name' => 'private-usuarios',
+                ])->assertForbidden();
+                // Simulate a subscription signed by the previous deployment, not new authorization.
+                $authorization = json_decode($pusher->authorizeChannel('private-usuarios', $socketId), true)['auth'];
+                fwrite($pipes[0], json_encode(['event' => 'pusher:subscribe', 'data' => [
+                    'channel' => 'private-usuarios', 'auth' => $authorization,
+                ]])."\n");
+                $subscribed = json_decode((string) fgets($pipes[1]), true, flags: JSON_THROW_ON_ERROR);
+                $this->assertSame('pusher_internal:subscription_succeeded', $subscribed['event']);
+            }
+            $payload = (new UserChanged($target->toArray()))->broadcastWith();
+            $fields = array_keys($payload['usuario']);
+            sort($fields);
+            $this->assertSame(['estado', 'id_usuario', 'nombre_completo', 'nombre_usuario', 'rol'], $fields);
+            $pusher->trigger('private-usuarios', 'probe.before', []);
+            foreach ($clients as [, $pipes]) {
+                $this->assertSame('probe.before', json_decode((string) fgets($pipes[1]), true)['event']);
+            }
+            auth()->forgetGuards();
+            $this->withCookie($cookieName, $sessions[0]);
+            if ($newRole === null) {
+                $this->patchJson("/api/users/{$target->id_usuario}/estado", ['estado' => 'INACTIVO'])->assertOk();
+            } else {
+                $this->patchJson("/api/users/{$target->id_usuario}", [
+                    'nombre_completo' => $target->nombre_completo,
+                    'nombre_usuario' => $target->nombre_usuario, 'rol' => $newRole,
+                ])->assertOk();
+            }
+            auth()->forgetGuards();
+            $this->withCookie($cookieName, $sessions[1])->getJson('/api/users')->assertForbidden();
+            auth()->forgetGuards();
+            $this->postJson('/broadcasting/auth', [
+                'socket_id' => $socketId, 'channel_name' => 'private-usuarios',
+            ])->assertForbidden();
+            auth()->forgetGuards();
+            $this->withCookie($cookieName, $sessions[0]);
+            $this->performBroadcastMutation('create', $actor);
+            $other = User::factory()->create();
+            $this->performBroadcastMutation('update', $other);
+            $this->performBroadcastMutation('status', $other);
+            $this->patchJson("/api/users/{$other->id_usuario}/estado", ['estado' => 'ACTIVO'])->assertOk();
+            // Old serialized jobs must also have no destination under the updated code.
+            foreach ([UserCreated::class, UserChanged::class, UserStatus::class] as $eventClass) {
+                (new BroadcastEvent(new $eventClass($payload['usuario'])))
+                    ->handle(app(Factory::class));
+            }
+            // Barrier on each still-open socket: any user event before this fails the assertion.
+            $pusher->trigger('private-usuarios', 'probe.after', []);
+            foreach ($clients as [, $pipes]) {
+                $message = json_decode((string) fgets($pipes[1]), true, flags: JSON_THROW_ON_ERROR);
+                $this->assertSame('probe.after', $message['event']);
+                $this->assertSame([], json_decode($message['data'], true));
+            }
+        } finally {
+            foreach ($clients as [$process, $pipes]) {
+                proc_terminate($process);
+                foreach ($pipes as $pipe) {
+                    fclose($pipe);
+                }
+                proc_close($process);
+            }
+        }
+    }
+
+    #[TestWith(['CAJA', 'COCINA', 403])]
+    #[TestWith(['COCINA', 'TI', 200])]
+    #[TestWith(['TI', 'CAJA', 403])]
+    #[TestWith(['ADMINISTRADOR', 'COCINA', 403])]
+    public function test_existing_session_uses_new_role_on_next_request(string $initialRole, string $newRole, int $status): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->configureBroadcastAuth();
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $actor = User::factory()->administrator()->create();
+        $user = User::factory()->create(['rol' => $initialRole]);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123',
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+        $this->actingAs($actor, 'web')->patchJson("/api/users/{$user->id_usuario}", [
+            'nombre_completo' => $user->nombre_completo,
+            'nombre_usuario' => $user->nombre_usuario, 'rol' => $newRole,
+        ])->assertOk();
+        auth()->forgetGuards();
+        $this->withCookie($cookieName, $sessionId)->getJson('/api/user')
+            ->assertOk()->assertJsonPath('usuario.rol', $newRole);
+        auth()->forgetGuards();
+        $this->getJson('/api/users')->assertStatus($status);
+        auth()->forgetGuards();
+        $this->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456', 'channel_name' => 'private-usuarios',
+        ])->assertForbidden();
+    }
+
+    #[TestWith(['TI'])]
+    #[TestWith(['CAJA'])]
+    #[TestWith(['COCINA'])]
+    public function test_deactivation_allows_existing_session_but_blocks_its_next_protected_request(string $role): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $actor = User::factory()->administrator()->create();
+        $user = User::factory()->create(['rol' => $role]);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123',
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+        $this->actingAs($actor, 'web')->patchJson("/api/users/{$user->id_usuario}/estado", [
+            'estado' => 'INACTIVO',
+        ])->assertOk();
+        foreach (['/api/user', '/api/users'] as $uri) {
+            auth()->forgetGuards();
+            $this->withCookie($cookieName, $sessionId)->getJson($uri)->assertForbidden()
+                ->assertExactJson(['message' => 'El usuario se encuentra inactivo.']);
+        }
+        auth()->forgetGuards();
+        $this->postJson('/api/logout')->assertOk();
+    }
+
+    public function test_logout_invalidates_cookie_and_direct_access_requires_login_again(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => true,
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+        $rememberName = auth('web')->getRecallerName();
+        $rememberCookie = $login->getCookie($rememberName)->getValue();
+        auth()->forgetGuards();
+
+        $this->withCookie($rememberName, $rememberCookie)
+            ->withCookie($cookieName, $sessionId)->postJson('/api/logout')
+            ->assertOk()->assertCookieExpired($rememberName)
+            ->assertExactJson(['message' => 'Sesión cerrada correctamente.']);
+
+        foreach (['/api/user', '/api/users'] as $uri) {
+            auth()->forgetGuards();
+            $this->withCookie($rememberName, '')->withCookie($cookieName, $sessionId)
+                ->get($uri, ['Accept' => 'text/html'])
+                ->assertUnauthorized()->assertHeader('Content-Type', 'application/json');
+        }
+    }
+
+    public function test_registration_requires_all_four_fields_without_writing_an_audit(): void
+    {
+        $this->actingAs(User::factory()->create(['rol' => 'TI']), 'web');
+        $this->postJson('/api/users', [])->assertUnprocessable()
+            ->assertJsonValidationErrors(['nombre_completo', 'nombre_usuario', 'contrasena', 'rol']);
+        $this->assertDatabaseCount('usuarios', 1);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_registration_rejects_normalized_duplicate_username(): void
+    {
+        $this->actingAs(User::factory()->create(['rol' => 'TI', 'nombre_usuario' => 'EXISTENTE']), 'web');
+        $this->postJson('/api/users', [
+            'nombre_completo' => 'Otra persona', 'nombre_usuario' => ' existente ',
+            'contrasena' => 'Password123', 'rol' => 'CAJA',
+        ])->assertUnprocessable()->assertJsonValidationErrors('nombre_usuario')
+            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario ya está registrado.');
+        $this->assertDatabaseCount('usuarios', 1);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    #[TestWith(['Abc1234'])]
+    #[TestWith(['abcdefgh'])]
+    #[TestWith(['12345678'])]
+    public function test_registration_rejects_invalid_password_without_creating_user(string $password): void
+    {
+        $this->actingAs(User::factory()->create(['rol' => 'TI']), 'web');
+        $this->postJson('/api/users', [
+            'nombre_completo' => 'Nueva persona', 'nombre_usuario' => 'NUEVA',
+            'contrasena' => $password, 'rol' => 'CAJA',
+        ])->assertUnprocessable()->assertJsonValidationErrors('contrasena');
+        $this->assertDatabaseCount('usuarios', 1);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    #[TestWith(['ADMINISTRADOR'])]
+    #[TestWith(['TI'])]
+    #[TestWith(['CAJA'])]
+    #[TestWith(['COCINA'])]
+    public function test_ti_registration_assigns_role_lists_user_and_records_timestamped_actor(string $role): void
+    {
+        $this->freezeTime();
+        $actor = User::factory()->create(['rol' => 'TI']);
+        $this->actingAs($actor, 'web');
+        $response = $this->postJson('/api/users', [
+            'nombre_completo' => 'Nueva persona', 'nombre_usuario' => 'NUEVA',
+            'contrasena' => 'Password123', 'rol' => $role,
+        ])->assertCreated()->assertJsonPath('usuario.rol', $role);
+        $this->getJson('/api/users')->assertOk()->assertJsonFragment($response->json('usuario'));
+        $created = User::findOrFail($response->json('usuario.id_usuario'));
+        $this->assertTrue(Hash::check('Password123', $created->contrasena_hash));
+        $audit = Bitacora::sole();
+        $this->assertSame($actor->id_usuario, $audit->id_usuario);
+        $this->assertSame(now()->format('Y-m-d H:i:s'), $audit->fecha->format('Y-m-d H:i:s'));
+        $this->assertSame('GESTION_USUARIOS', $audit->tipo_movimiento);
+        $this->assertSame("Usuario NUEVA (ID {$created->id_usuario}) creado.", $audit->descripcion_movimiento);
+        $this->assertStringNotContainsString('Password123', $audit->toJson());
+        $this->assertStringNotContainsString($created->contrasena_hash, $audit->toJson());
+    }
+
+    #[TestWith(['ADMINISTRADOR'])]
+    #[TestWith(['TI'])]
+    public function test_logins_and_logout_preserve_other_browser_session_and_remember_cookie(string $role): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->configureBroadcastAuth();
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => $role]);
+        $credentials = ['username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => true];
+        $cookieName = config('session.cookie');
+        $first = $this->postJson('/api/login', $credentials)->assertOk()->assertJsonMissingPath('control');
+        $firstSession = $first->getCookie($cookieName)->getValue();
+        $rememberName = auth('web')->getRecallerName();
+        $firstRemember = $first->getCookie($rememberName)->getValue();
+        auth()->forgetGuards();
+        $second = $this->postJson('/api/login', $credentials)->assertOk()->assertJsonMissingPath('control');
+        $secondSession = $second->getCookie($cookieName)->getValue();
+        $this->assertNotSame($firstSession, $secondSession);
+
+        foreach ([$firstSession, $secondSession, $firstSession] as $sessionId) {
+            auth()->forgetGuards();
+            $this->withCookie($cookieName, $sessionId);
+            $this->getJson('/api/user')->assertOk()->assertJsonPath('usuario.id_usuario', $user->getKey());
+            $this->getJson('/api/users')->assertOk();
+            $this->postJson('/broadcasting/auth', [
+                'socket_id' => '123.456', 'channel_name' => 'private-usuarios',
+            ])->assertForbidden();
+        }
+
+        auth()->forgetGuards();
+        $this->withCookie($cookieName, $secondSession)->postJson('/api/logout')->assertOk();
+        auth()->forgetGuards();
+        $this->getJson('/api/user')->assertUnauthorized();
+        auth()->forgetGuards();
+        $this->withCookie($cookieName, $firstSession)->getJson('/api/user')->assertOk();
+        auth()->forgetGuards();
+        $this->withCookie($cookieName, '')->withCookie($rememberName, $firstRemember);
+        $this->getJson('/api/user')->assertOk()->assertJsonPath('usuario.id_usuario', $user->getKey());
+    }
+
+    #[TestWith(['GET', '/api/users'])]
+    #[TestWith(['GET', '/api/user'])]
+    #[TestWith(['POST', '/api/users'])]
+    #[TestWith(['PATCH', '/api/users/999'])]
+    #[TestWith(['PATCH', '/api/users/999/estado'])]
+    #[TestWith(['POST', '/api/logout'])]
+    public function test_api_guest_receives_401_json_when_accepting_html(string $method, string $uri): void
+    {
+        $this->call($method, $uri, [], [], [], ['HTTP_ACCEPT' => 'text/html'])
+            ->assertUnauthorized()
+            ->assertHeader('Content-Type', 'application/json')
+            ->assertHeaderMissing('Location')
+            ->assertExactJson(['message' => 'Unauthenticated.']);
+    }
+
+    #[TestWith(['COCINA', 403])]
+    #[TestWith(['ADMINISTRADOR', 200])]
+    #[TestWith(['TI', 200])]
+    public function test_html_accept_preserves_authenticated_user_permissions(string $role, int $status): void
+    {
+        $user = User::factory()->create(['rol' => $role]);
+
+        $response = $this->actingAs($user, 'web')
+            ->get('/api/users', ['Accept' => 'text/html'])
+            ->assertStatus($status)
+            ->assertHeader('Content-Type', 'application/json')
+            ->assertHeaderMissing('Location');
+
+        if ($status === 403) {
+            $response->assertJsonPath('message', 'No tiene permiso para gestionar usuarios.');
+        } else {
+            $response->assertJsonPath('usuarios.0.id_usuario', $user->id_usuario);
+        }
+    }
+
+    #[TestWith(['create'])]
+    #[TestWith(['update'])]
+    #[TestWith(['status'])]
+    public function test_active_ti_can_mutate_users_and_is_the_audit_actor(string $action): void
+    {
+        $actor = User::factory()->create(['rol' => 'TI']);
+        $user = User::factory()->create();
+        Queue::fake([BroadcastEvent::class]);
+        $this->actingAs($actor, 'web');
+
+        $response = $this->performBroadcastMutation($action, $user);
+
+        $this->assertDatabaseHas('usuarios', $response->json('usuario'));
+        $this->assertDatabaseCount('bitacoras', 1);
+        $this->assertSame($actor->id_usuario, Bitacora::sole()->id_usuario);
+        $this->assertSame(
+            ['id_usuario', 'nombre_completo', 'nombre_usuario', 'rol', 'estado'],
+            array_keys($response->json('usuario'))
+        );
+        Queue::assertNothingPushed();
+    }
+
+    public function test_ti_session_can_be_restored_and_list_users(): void
+    {
+        $actor = User::factory()->create(['rol' => 'TI']);
+        $this->actingAs($actor, 'web');
+
+        $this->getJson('/api/user')->assertOk()->assertJsonPath('usuario.rol', 'TI');
+        $this->getJson('/api/users')->assertOk()
+            ->assertJsonPath('usuarios.0.id_usuario', $actor->id_usuario);
+    }
+
+    public function test_ti_can_reactivate_and_reset_lockout(): void
+    {
+        $actor = User::factory()->create(['rol' => 'TI']);
+        $user = User::factory()->inactive()->create([
+            'intentos_fallidos' => 5,
+            'bloqueado_hasta' => now()->addMinutes(5),
+        ]);
+        $this->actingAs($actor, 'web');
+
+        $this->patchJson("/api/users/{$user->id_usuario}/estado", ['estado' => 'ACTIVO'])
+            ->assertOk()->assertJsonPath('usuario.estado', 'ACTIVO');
+
+        $this->assertDatabaseHas('usuarios', [
+            'id_usuario' => $user->id_usuario,
+            'estado' => 'ACTIVO',
+            'intentos_fallidos' => 0,
+            'bloqueado_hasta' => null,
+        ]);
+        $this->assertSame($actor->id_usuario, Bitacora::sole()->id_usuario);
+    }
+
+    #[TestWith([null, 'ACTIVO', 401])]
+    #[TestWith(['CAJA', 'ACTIVO', 403])]
+    #[TestWith(['COCINA', 'ACTIVO', 403])]
+    #[TestWith(['ADMINISTRADOR', 'INACTIVO', 403])]
+    #[TestWith(['TI', 'INACTIVO', 403])]
+    public function test_user_management_denies_all_operations_without_permission(
+        ?string $role,
+        string $status,
+        int $expectedStatus
+    ): void {
+        $user = User::factory()->create();
+        $original = $user->fresh()->getAttributes();
+        if ($role !== null) {
+            $this->actingAs(User::factory()->create(['rol' => $role, 'estado' => $status]), 'web');
+        }
+        Queue::fake([BroadcastEvent::class]);
+        $data = [
+            'nombre_completo' => 'Cambio prohibido',
+            'nombre_usuario' => 'PROHIBIDO',
+            'contrasena' => 'Password123',
+            'rol' => 'CAJA',
+        ];
+
+        $this->getJson('/api/users')->assertStatus($expectedStatus);
+        $this->postJson('/api/users', $data)->assertStatus($expectedStatus);
+        $this->patchJson("/api/users/{$user->id_usuario}", $data)->assertStatus($expectedStatus);
+        $this->patchJson("/api/users/{$user->id_usuario}/estado", ['estado' => 'INACTIVO'])
+            ->assertStatus($expectedStatus);
+
+        $this->assertSame($original, $user->fresh()->getAttributes());
+        $this->assertDatabaseMissing('usuarios', ['nombre_usuario' => 'PROHIBIDO']);
+        $this->assertDatabaseCount('bitacoras', 0);
+        Queue::assertNothingPushed();
+    }
+
+    public function test_broadcast_auth_returns_401_without_session(): void
+    {
+        $this->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456',
+            'channel_name' => 'private-usuarios',
+        ])->assertUnauthorized();
+    }
+
+    #[TestWith(['ADMINISTRADOR', 'INACTIVO'])]
+    #[TestWith(['CAJA', 'ACTIVO'])]
+    #[TestWith(['COCINA', 'ACTIVO'])]
+    #[TestWith(['TI', 'INACTIVO'])]
+    public function test_broadcast_auth_returns_403_without_active_user_manager(
+        string $role,
+        string $status
+    ): void {
+        $this->configureBroadcastAuth();
+        $user = User::factory()->create(['rol' => $role, 'estado' => $status]);
+
+        $this->actingAs($user, 'web')->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456',
+            'channel_name' => 'private-usuarios',
+        ])->assertForbidden();
+    }
+
+    #[TestWith(['ADMINISTRADOR'])]
+    #[TestWith(['TI'])]
+    public function test_retired_private_channel_denies_even_active_user_managers(string $role): void
+    {
+        $this->configureBroadcastAuth();
+        $user = User::factory()->create(['rol' => $role]);
+
+        $this->actingAs($user, 'web')->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456',
+            'channel_name' => 'private-usuarios',
+        ])->assertForbidden();
+    }
+
+    private function configureBroadcastAuth(): void
+    {
+        config([
+            'broadcasting.default' => 'reverb',
+            'broadcasting.connections.reverb.key' => 'test-key',
+            'broadcasting.connections.reverb.secret' => 'test-secret',
+            'broadcasting.connections.reverb.app_id' => 'test-app',
+        ]);
+        require base_path('routes/channels.php');
+    }
+
+    #[TestWith([UserCreated::class])]
+    #[TestWith([UserChanged::class])]
+    #[TestWith([UserStatus::class])]
+    public function test_retired_user_event_has_safe_payload_but_no_destinations(string $eventClass): void
+    {
+        $public = [
+            'id_usuario' => 10,
+            'nombre_completo' => 'Usuario de prueba',
+            'nombre_usuario' => 'PRUEBA',
+            'rol' => 'CAJA',
+            'estado' => 'ACTIVO',
+        ];
+        $event = new $eventClass($public + [
+            'contrasena' => 'secret',
+            'contrasena_hash' => 'hash',
+            'remember_token' => 'token',
+            'intentos_fallidos' => 5,
+            'bloqueado_hasta' => '2026-01-01',
+        ]);
+
+        $this->assertSame(['usuario' => $public], $event->broadcastWith());
+        $this->assertSame($public, $event->usuario);
+        $this->assertSame([], $event->broadcastOn());
+    }
+
+    #[TestWith(['create', UserCreated::class])]
+    #[TestWith(['update', UserChanged::class])]
+    #[TestWith(['status', UserStatus::class])]
+    public function test_user_mutation_does_not_queue_event_even_after_outer_commit(
+        string $action,
+        string $eventClass
+    ): void {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create();
+        Queue::fake([BroadcastEvent::class]);
+        Sanctum::actingAs($administrator);
+        DB::beginTransaction();
+
+        $response = $this->performBroadcastMutation($action, $user);
+        Queue::assertNothingPushed();
+        DB::commit();
+
+        $this->assertSame([], (new $eventClass($response->json('usuario')))->broadcastOn());
+        Queue::assertNothingPushed();
+        $this->assertDatabaseCount('bitacoras', 1);
+    }
+
+    #[TestWith(['create'])]
+    #[TestWith(['update'])]
+    #[TestWith(['status'])]
+    public function test_rolled_back_user_mutation_does_not_queue_event(string $action): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create();
+        $original = $user->fresh()->getAttributes();
+        Queue::fake([BroadcastEvent::class]);
+        Sanctum::actingAs($administrator);
+        DB::beginTransaction();
+
+        $this->performBroadcastMutation($action, $user);
+        DB::rollBack();
+
+        Queue::assertNothingPushed();
+        $this->assertSame($original, $user->fresh()->getAttributes());
+        $this->assertDatabaseCount('usuarios', 2);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
+    public function test_reverb_failure_does_not_fail_confirmed_write(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $user = User::factory()->create();
+        Exceptions::fake();
+        Broadcast::extend('failing', fn () => new class extends NullBroadcaster
+        {
+            public function broadcast(array $channels, $event, array $payload = []): void
+            {
+                throw new RuntimeException('Simulated transport failure');
+            }
+        });
+        config(['broadcasting.default' => 'failing', 'broadcasting.connections.failing' => ['driver' => 'failing']]);
+        Sanctum::actingAs($administrator);
+
+        $this->performBroadcastMutation('update', $user);
+
+        $this->assertDatabaseHas('usuarios', [
+            'id_usuario' => $user->id_usuario,
+            'nombre_completo' => 'Nombre confirmado',
+        ]);
+        $this->assertDatabaseCount('bitacoras', 1);
+        Exceptions::assertNothingReported();
+    }
+
+    private function performBroadcastMutation(string $action, User $user): TestResponse
+    {
+        $data = [
+            'nombre_completo' => 'Nombre confirmado',
+            'nombre_usuario' => $user->nombre_usuario,
+            'rol' => $user->rol,
+        ];
+
+        return match ($action) {
+            'create' => $this->postJson('/api/users', [
+                ...$data,
+                'nombre_usuario' => 'NUEVO.BROADCAST',
+                'contrasena' => 'Password123',
+            ])->assertCreated(),
+            'update' => $this->patchJson("/api/users/{$user->id_usuario}", $data)->assertOk(),
+            'status' => $this->patchJson("/api/users/{$user->id_usuario}/estado", [
+                'estado' => 'INACTIVO',
+            ])->assertOk(),
+        };
+    }
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -963,9 +1557,11 @@ class UserManagementTest extends TestCase
         );
     }
 
-    public function test_administrator_cannot_deactivate_itself(): void
+    #[TestWith(['ADMINISTRADOR'])]
+    #[TestWith(['TI'])]
+    public function test_user_manager_cannot_deactivate_itself(string $role): void
     {
-        $administrator = User::factory()->administrator()->create();
+        $administrator = User::factory()->create(['rol' => $role]);
         User::factory()->administrator()->create();
 
         Sanctum::actingAs($administrator);
@@ -983,12 +1579,7 @@ class UserManagementTest extends TestCase
 
     public function test_last_active_administrator_cannot_be_deactivated(): void
     {
-        $this->withoutMiddleware(EnsureUserIsActive::class);
-
-        $actor = User::factory()
-            ->administrator()
-            ->inactive()
-            ->create();
+        $actor = User::factory()->create(['rol' => 'TI']);
         $lastActiveAdministrator = User::factory()
             ->administrator()
             ->create();
@@ -1011,12 +1602,7 @@ class UserManagementTest extends TestCase
 
     public function test_last_active_administrator_cannot_change_role(): void
     {
-        $this->withoutMiddleware(EnsureUserIsActive::class);
-
-        $actor = User::factory()
-            ->administrator()
-            ->inactive()
-            ->create();
+        $actor = User::factory()->create(['rol' => 'TI']);
         $lastActiveAdministrator = User::factory()
             ->administrator()
             ->create([

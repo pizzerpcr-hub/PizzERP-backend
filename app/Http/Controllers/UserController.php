@@ -10,9 +10,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 use Illuminate\Validation\ValidationException;
-use App\Events\UserChanged;
-use App\Events\UserCreated;
-use App\Events\UserStatus;
 
 class UserController extends Controller
 {
@@ -40,7 +37,7 @@ class UserController extends Controller
 
     public function store(Request $request): JsonResponse
     {
-        $administrator = $this->authenticatedAdministrator($request);
+        $administrator = $this->authenticatedUserManager($request);
 
         $request->merge([
             'nombre_completo' => trim(
@@ -101,8 +98,6 @@ class UserController extends Controller
                 'bloqueado_hasta' => null,
             ]);
 
-            broadcast(new UserCreated($user->toArray()));
-
             $this->recordAudit(
                 $administrator,
                 "Usuario {$user->nombre_usuario} (ID {$user->id_usuario}) creado.",
@@ -120,7 +115,7 @@ class UserController extends Controller
 
     public function index(Request $request): JsonResponse
     {
-        $this->authenticatedAdministrator($request);
+        $this->authenticatedUserManager($request);
 
         $users = User::query()
             ->select(self::PUBLIC_COLUMNS)
@@ -136,7 +131,7 @@ class UserController extends Controller
 
     public function update(Request $request): JsonResponse
     {
-        $administrator = $this->authenticatedAdministrator($request);
+        $administrator = $this->authenticatedUserManager($request);
         $userId = $request->route('user');
 
         $request->merge([
@@ -238,9 +233,6 @@ class UserController extends Controller
                 );
             }
 
-
-            broadcast(new UserChanged($lockedUser->fresh()->toArray()));
-
             return $lockedUser;
         });
 
@@ -252,7 +244,7 @@ class UserController extends Controller
 
     public function updateStatus(Request $request): JsonResponse
     {
-        $administrator = $this->authenticatedAdministrator($request);
+        $administrator = $this->authenticatedUserManager($request);
         $userId = $request->route('user');
 
         $request->merge([
@@ -334,13 +326,7 @@ class UserController extends Controller
                     "Estado del usuario {$lockedUser->nombre_usuario} (ID {$lockedUser->id_usuario}) actualizado.",
                     "Estado anterior: {$previousStatus}; estado nuevo: {$lockedUser->estado}."
                 );
-
-                broadcast(new UserStatus(
-                    $this->userPayload($lockedUser)
-                ));
             }
-
-            
 
             return $lockedUser;
         });
@@ -351,14 +337,13 @@ class UserController extends Controller
         ]);
     }
 
-    private function authenticatedAdministrator(Request $request): User
+    private function authenticatedUserManager(Request $request): User
     {
         $authenticatedUser = $request->user();
 
         if (
             ! $authenticatedUser instanceof User
-            || mb_strtoupper($authenticatedUser->rol)
-                !== self::ADMINISTRATOR_ROLE
+            || ! $authenticatedUser->canManageUsers()
         ) {
             abort(403, 'No tiene permiso para gestionar usuarios.');
         }

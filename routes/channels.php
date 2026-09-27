@@ -1,7 +1,3 @@
 <?php
 
-use Illuminate\Support\Facades\Broadcast;
-
-Broadcast::channel('App.Models.User.{id}', function ($user, $id) {
-    return (int) $user->id === (int) $id;
-});
+// User data is retrieved through the protected API; the usuarios channel is retired.

@@ -45,6 +45,12 @@ class User extends Authenticatable
         return 'contrasena_hash';
     }
 
+    public function canManageUsers(): bool
+    {
+        return mb_strtoupper(trim((string) $this->estado)) === 'ACTIVO'
+            && in_array(mb_strtoupper(trim((string) $this->rol)), ['ADMINISTRADOR', 'TI'], true);
+    }
+
     public function bitacoras(): HasMany
     {
         return $this->hasMany(
