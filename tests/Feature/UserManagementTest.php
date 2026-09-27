@@ -609,6 +609,16 @@ class UserManagementTest extends TestCase
         };
     }
 
+    private function assertLoginRateLimited(TestResponse $response): void
+    {
+        $response
+            ->assertStatus(429)
+            ->assertJsonPath('message', "Se alcanzó el limite de intentos.\n");
+
+        $this->assertIsInt($response->json('retry_after'));
+        $this->assertGreaterThan(0, $response->json('retry_after'));
+    }
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -801,7 +811,7 @@ class UserManagementTest extends TestCase
             'Referer' => 'http://localhost/',
         ]);
 
-        foreach (['NO.EXISTE', 'PRIMER.USUARIO', 'OTRO.INEXISTENTE', 'SEGUNDO.USUARIO', 'TERCERO.INEXISTENTE'] as $username) {
+        foreach (['NO.EXISTE', 'PRIMER.USUARIO', 'OTRO.INEXISTENTE', 'SEGUNDO.USUARIO'] as $username) {
             $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
                 ->postJson('/api/login', [
                     'username' => $username,
@@ -812,6 +822,14 @@ class UserManagementTest extends TestCase
                     'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
                 ]);
         }
+
+        $this->assertLoginRateLimited(
+            $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+                ->postJson('/api/login', [
+                    'username' => 'TERCERO.INEXISTENTE',
+                    'password' => 'WrongPassword456',
+                ])
+        );
 
         DB::connection()->flushQueryLog();
         DB::connection()->enableQueryLog();
@@ -828,11 +846,7 @@ class UserManagementTest extends TestCase
             DB::connection()->flushQueryLog();
         }
 
-        $blockedResponse
-            ->assertUnauthorized()
-            ->assertExactJson([
-                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
-            ]);
+        $this->assertLoginRateLimited($blockedResponse);
         $this->assertCount(0, $queries);
         $this->assertDatabaseCount('bitacoras', 2);
 
@@ -895,17 +909,22 @@ class UserManagementTest extends TestCase
             'Referer' => 'http://localhost/',
         ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.30']);
 
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
+        for ($attempt = 1; $attempt <= 4; $attempt++) {
             $this->postJson('/api/login', [
                 'username' => 'NO.EXISTE',
                 'password' => 'Password123',
             ])->assertUnauthorized();
         }
 
-        $this->postJson('/api/login', [
+        $this->assertLoginRateLimited($this->postJson('/api/login', [
+            'username' => 'NO.EXISTE',
+            'password' => 'Password123',
+        ]));
+
+        $this->assertLoginRateLimited($this->postJson('/api/login', [
             'username' => 'DESPUES.DEL.PLAZO',
             'password' => 'Password123',
-        ])->assertUnauthorized();
+        ]));
 
         $this->assertDatabaseCount('bitacoras', 0);
 
@@ -934,25 +953,26 @@ class UserManagementTest extends TestCase
         ]);
 
         for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $this->withHeaders(['X-Forwarded-For' => "198.51.100.{$attempt}"])
+            $response = $this->withHeaders(['X-Forwarded-For' => "198.51.100.{$attempt}"])
                 ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
                     'password' => 'Password123',
-                ])
-                ->assertUnauthorized();
+                ]);
+
+            $attempt < 5
+                ? $response->assertUnauthorized()
+                : $this->assertLoginRateLimited($response);
         }
 
-        $this->withHeaders(['X-Forwarded-For' => '198.51.100.6'])
-            ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
-            ->postJson('/api/login', [
-                'username' => 'USUARIO.CABECERAS',
-                'password' => 'Password123',
-            ])
-            ->assertUnauthorized()
-            ->assertExactJson([
-                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
-            ]);
+        $this->assertLoginRateLimited(
+            $this->withHeaders(['X-Forwarded-For' => '198.51.100.6'])
+                ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
+                ->postJson('/api/login', [
+                    'username' => 'USUARIO.CABECERAS',
+                    'password' => 'Password123',
+                ])
+        );
 
         $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.41'])
             ->postJson('/api/login', [
@@ -977,20 +997,24 @@ class UserManagementTest extends TestCase
         ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.50']);
 
         for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $this->withHeader('X-Forwarded-For', '198.51.100.50')
+            $response = $this->withHeader('X-Forwarded-For', '198.51.100.50')
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
                     'password' => 'Password123',
-                ])
-                ->assertUnauthorized();
+                ]);
+
+            $attempt < 5
+                ? $response->assertUnauthorized()
+                : $this->assertLoginRateLimited($response);
         }
 
-        $this->withHeader('X-Forwarded-For', '198.51.100.50')
-            ->postJson('/api/login', [
-                'username' => 'USUARIO.PROXY',
-                'password' => 'Password123',
-            ])
-            ->assertUnauthorized();
+        $this->assertLoginRateLimited(
+            $this->withHeader('X-Forwarded-For', '198.51.100.50')
+                ->postJson('/api/login', [
+                    'username' => 'USUARIO.PROXY',
+                    'password' => 'Password123',
+                ])
+        );
 
         $this->withHeader('X-Forwarded-For', '198.51.100.51')
             ->postJson('/api/login', [
