@@ -41,7 +41,7 @@ class AuthController extends Controller
     private function attemptLogin(LoginRequest $request, string $ipLimitKey): JsonResponse
     {
         if (RateLimiter::tooManyAttempts($ipLimitKey, self::MAX_IP_FAILED_ATTEMPTS)) {
-            return $this->failedLoginResponse();
+            return $this->tooManyAttemptsResponse($ipLimitKey);
         }
 
         $data = $request->validated();
@@ -215,15 +215,41 @@ class AuthController extends Controller
         });
     }
 
+    /*
+     * Respuesta genérica de credenciales inválidas.
+     * Si viene un $ipLimitKey, registra el intento fallido contra
+     * la IP y, si con este intento se alcanzó el límite, devuelve
+     * en su lugar la respuesta de "demasiados intentos" con el
+     * conteo regresivo — sin revelar nada sobre la cuenta puntual.
+     */
     private function failedLoginResponse(?string $ipLimitKey = null): JsonResponse
     {
         if ($ipLimitKey !== null) {
             RateLimiter::hit($ipLimitKey, self::IP_LIMIT_SECONDS);
+
+            if (RateLimiter::tooManyAttempts($ipLimitKey, self::MAX_IP_FAILED_ATTEMPTS)) {
+                return $this->tooManyAttemptsResponse($ipLimitKey);
+            }
         }
 
         return response()->json([
             'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
         ], 401);
+    }
+
+    /*
+     * Respuesta cuando se excedió el límite de intentos por IP.
+     * No menciona si la cuenta existe, está bloqueada o inactiva:
+     * el mensaje es igual para cualquier motivo de fallo previo.
+     */
+    private function tooManyAttemptsResponse(string $ipLimitKey): JsonResponse
+    {
+        $segundosRestantes = RateLimiter::availableIn($ipLimitKey);
+
+        return response()->json([
+            'message' => "Se alcanzó el limite de intentos.\n",
+            'retry_after' => $segundosRestantes,
+        ], 429);
     }
 
     private function recordAudit(
