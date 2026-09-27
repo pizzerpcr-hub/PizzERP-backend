@@ -609,6 +609,40 @@ class UserManagementTest extends TestCase
         };
     }
 
+    public function test_create_user_command_stores_uppercase_username(): void
+    {
+        $this->artisan('pizzerp:create-user')
+            ->expectsQuestion('Nombre completo', 'Ana Pérez')
+            ->expectsQuestion('Nombre de usuario', ' ana.perez ')
+            ->expectsChoice('Rol', 'CAJA', User::ROLES)
+            ->expectsQuestion('Contraseña (mínimo 8 caracteres, letras y números)', 'Password123')
+            ->expectsQuestion('Confirme la contraseña', 'Password123')
+            ->expectsOutput('Usuario ANA.PEREZ creado correctamente.')
+            ->assertSuccessful();
+
+        $this->assertDatabaseHas('usuarios', [
+            'nombre_usuario' => 'ANA.PEREZ',
+            'rol' => 'CAJA',
+            'estado' => 'ACTIVO',
+        ]);
+    }
+
+    public function test_create_user_command_rejects_duplicate_username_in_any_case(): void
+    {
+        User::factory()->create(['nombre_usuario' => 'ANA.PEREZ']);
+
+        $this->artisan('pizzerp:create-user')
+            ->expectsQuestion('Nombre completo', 'Ana Pérez')
+            ->expectsQuestion('Nombre de usuario', 'ana.perez')
+            ->expectsChoice('Rol', 'TI', User::ROLES)
+            ->expectsQuestion('Contraseña (mínimo 8 caracteres, letras y números)', 'Password123')
+            ->expectsQuestion('Confirme la contraseña', 'Password123')
+            ->expectsOutput('El nombre de usuario ya está registrado.')
+            ->assertFailed();
+
+        $this->assertDatabaseCount('usuarios', 1);
+    }
+
     private function assertLoginRateLimited(TestResponse $response): void
     {
         $response

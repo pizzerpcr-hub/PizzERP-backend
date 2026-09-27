@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\User;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 
 class CreateSystemUser extends Command
 {
@@ -19,12 +20,13 @@ class CreateSystemUser extends Command
             (string) $this->ask('Nombre completo')
         );
 
-        $nombreUsuario = trim(
+        // La tabla exige nombres de usuario en mayúsculas.
+        $nombreUsuario = mb_strtoupper(trim(
             (string) $this->ask('Nombre de usuario')
-        );
+        ));
 
         $rol = mb_strtoupper(trim(
-            (string) $this->ask('Rol', 'ADMINISTRADOR')
+            (string) $this->choice('Rol', User::ROLES, 'ADMINISTRADOR')
         ));
 
         $password = (string) $this->secret(
@@ -60,8 +62,7 @@ class CreateSystemUser extends Command
             ],
             'rol' => [
                 'required',
-                'string',
-                'max:30',
+                Rule::in(User::ROLES),
             ],
             'password' => [
                 'required',
@@ -71,26 +72,16 @@ class CreateSystemUser extends Command
                 'regex:/[0-9]/',
             ],
         ], [
-            'nombre_completo.required' =>
-                'El nombre completo es obligatorio.',
-            'nombre_completo.max' =>
-                'El nombre completo no puede superar 100 caracteres.',
-            'nombre_usuario.required' =>
-                'El nombre de usuario es obligatorio.',
-            'nombre_usuario.max' =>
-                'El nombre de usuario no puede superar 50 caracteres.',
-            'nombre_usuario.unique' =>
-                'El nombre de usuario ya está registrado.',
-            'rol.required' =>
-                'El rol es obligatorio.',
-            'rol.max' =>
-                'El rol no puede superar 30 caracteres.',
-            'password.required' =>
-                'La contraseña es obligatoria.',
-            'password.min' =>
-                'La contraseña debe tener al menos 8 caracteres.',
-            'password.regex' =>
-                'La contraseña debe contener letras y números.',
+            'nombre_completo.required' => 'El nombre completo es obligatorio.',
+            'nombre_completo.max' => 'El nombre completo no puede superar 100 caracteres.',
+            'nombre_usuario.required' => 'El nombre de usuario es obligatorio.',
+            'nombre_usuario.max' => 'El nombre de usuario no puede superar 50 caracteres.',
+            'nombre_usuario.unique' => 'El nombre de usuario ya está registrado.',
+            'rol.required' => 'El rol es obligatorio.',
+            'rol.in' => 'El rol debe ser ADMINISTRADOR, CAJA, COCINA o TI.',
+            'password.required' => 'La contraseña es obligatoria.',
+            'password.min' => 'La contraseña debe tener al menos 8 caracteres.',
+            'password.regex' => 'La contraseña debe contener letras y números.',
         ]);
 
         if ($validator->fails()) {

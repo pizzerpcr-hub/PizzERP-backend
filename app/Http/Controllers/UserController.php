@@ -15,12 +15,7 @@ class UserController extends Controller
 {
     private const ADMINISTRATOR_ROLE = 'ADMINISTRADOR';
 
-    private const ALLOWED_ROLES = [
-        self::ADMINISTRATOR_ROLE,
-        'CAJA',
-        'COCINA',
-        'TI',
-    ];
+    private const ALLOWED_ROLES = User::ROLES;
 
     private const ALLOWED_STATUSES = [
         'ACTIVO',
