@@ -11,6 +11,12 @@ return new class extends Migration
      */
     public function up(): void
     {
+        // La tabla ya fue creada y renombrada a usuarios por
+        // 2026_09_20_062333_adapt_users_table_to_pizzerp_schema.
+        if (Schema::hasTable('usuarios')) {
+            return;
+        }
+
         Schema::create('users', function (Blueprint $table) {
             $table->id();
             $table->string('nombre_completo');

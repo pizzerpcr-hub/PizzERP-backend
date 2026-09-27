@@ -9,6 +9,21 @@ return new class extends Migration
 {
     public function up(): void
     {
+        // En una base nueva esta migración corre antes de
+        // 2026_09_21_033119_create_users_table, así que se crea aquí
+        // la tabla original para poder adaptarla.
+        if (! Schema::hasTable('users')) {
+            Schema::create('users', function (Blueprint $table) {
+                $table->id();
+                $table->string('nombre_completo');
+                $table->string('nombre_usuario')->unique();
+                $table->string('contrasena');
+                $table->string('rol');
+                $table->boolean('estado')->default(true);
+                $table->timestamps();
+            });
+        }
+
         Schema::rename('users', 'usuarios');
 
         Schema::table('usuarios', function (Blueprint $table) {
