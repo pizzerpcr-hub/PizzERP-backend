@@ -830,8 +830,9 @@ class UserManagementTest extends TestCase
         ]);
     }
 
-    public function test_five_failures_across_usernames_block_only_the_same_ip_before_user_lookup(): void
+    public function test_five_failures_across_usernames_block_only_the_same_browser_before_user_lookup(): void
     {
+        $this->withCredentials();
         $firstUser = User::factory()->create([
             'nombre_usuario' => 'PRIMER.USUARIO',
         ]);
@@ -845,8 +846,10 @@ class UserManagementTest extends TestCase
             'Referer' => 'http://localhost/',
         ]);
 
+        $browserCookie = null;
+
         foreach (['NO.EXISTE', 'PRIMER.USUARIO', 'OTRO.INEXISTENTE', 'SEGUNDO.USUARIO'] as $username) {
-            $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
                 ->postJson('/api/login', [
                     'username' => $username,
                     'password' => 'WrongPassword456',
@@ -855,10 +858,11 @@ class UserManagementTest extends TestCase
                 ->assertExactJson([
                     'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
                 ]);
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
         }
 
         $this->assertLoginRateLimited(
-            $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+            $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', [
                     'username' => 'TERCERO.INEXISTENTE',
                     'password' => 'WrongPassword456',
@@ -869,7 +873,7 @@ class UserManagementTest extends TestCase
         DB::connection()->enableQueryLog();
 
         try {
-            $blockedResponse = $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.10'])
+            $blockedResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', [
                     'username' => 'PRIMER.USUARIO',
                     'password' => 'Password123',
@@ -884,7 +888,7 @@ class UserManagementTest extends TestCase
         $this->assertCount(0, $queries);
         $this->assertDatabaseCount('bitacoras', 2);
 
-        $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.11'])
+        $this->withCookie('pizzerp_login_browser', '')
             ->postJson('/api/login', [
                 'username' => 'PRIMER.USUARIO',
                 'password' => 'Password123',
@@ -929,8 +933,9 @@ class UserManagementTest extends TestCase
         $this->assertDatabaseCount('bitacoras', 6);
     }
 
-    public function test_ip_limit_expires_after_five_minutes_and_valid_login_succeeds(): void
+    public function test_browser_limit_expires_five_minutes_after_fifth_failure_and_valid_login_succeeds(): void
     {
+        $this->withCredentials();
         $this->freezeTime();
 
         $user = User::factory()->create([
@@ -941,30 +946,39 @@ class UserManagementTest extends TestCase
         $this->withHeaders([
             'Origin' => 'http://localhost',
             'Referer' => 'http://localhost/',
-        ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.30']);
+        ]);
+
+        $browserCookie = null;
 
         for ($attempt = 1; $attempt <= 4; $attempt++) {
-            $this->postJson('/api/login', [
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')->postJson('/api/login', [
                 'username' => 'NO.EXISTE',
                 'password' => 'Password123',
             ])->assertUnauthorized();
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
+            $this->travel(6)->minutes();
         }
 
-        $this->assertLoginRateLimited($this->postJson('/api/login', [
+        $fifthResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
             'username' => 'NO.EXISTE',
             'password' => 'Password123',
-        ]));
+        ]);
+        $this->assertLoginRateLimited($fifthResponse);
+        $fifthResponse->assertJsonPath('retry_after', 300);
 
-        $this->assertLoginRateLimited($this->postJson('/api/login', [
+        $this->travel(4)->minutes();
+        $blockedResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
             'username' => 'DESPUES.DEL.PLAZO',
             'password' => 'Password123',
-        ]));
+        ]);
+        $this->assertLoginRateLimited($blockedResponse);
+        $blockedResponse->assertJsonPath('retry_after', 60);
 
         $this->assertDatabaseCount('bitacoras', 0);
 
-        $this->travel(301)->seconds();
+        $this->travel(61)->seconds();
 
-        $this->postJson('/api/login', [
+        $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
             'username' => 'DESPUES.DEL.PLAZO',
             'password' => 'Password123',
         ])
@@ -974,8 +988,9 @@ class UserManagementTest extends TestCase
         $this->assertDatabaseCount('bitacoras', 1);
     }
 
-    public function test_forwarded_for_header_cannot_spoof_untrusted_ip_limit(): void
+    public function test_same_ip_does_not_share_browser_limit(): void
     {
+        $this->withCredentials();
         $user = User::factory()->create([
             'nombre_usuario' => 'USUARIO.CABECERAS',
         ]);
@@ -986,8 +1001,9 @@ class UserManagementTest extends TestCase
             'Referer' => 'http://localhost/',
         ]);
 
+        $browserCookie = null;
         for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $response = $this->withHeaders(['X-Forwarded-For' => "198.51.100.{$attempt}"])
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
                 ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
@@ -997,10 +1013,11 @@ class UserManagementTest extends TestCase
             $attempt < 5
                 ? $response->assertUnauthorized()
                 : $this->assertLoginRateLimited($response);
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
         }
 
         $this->assertLoginRateLimited(
-            $this->withHeaders(['X-Forwarded-For' => '198.51.100.6'])
+            $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
                 ->postJson('/api/login', [
                     'username' => 'USUARIO.CABECERAS',
@@ -1008,7 +1025,8 @@ class UserManagementTest extends TestCase
                 ])
         );
 
-        $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.41'])
+        $this->withCookie('pizzerp_login_browser', '')
+            ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
             ->postJson('/api/login', [
                 'username' => 'USUARIO.CABECERAS',
                 'password' => 'Password123',
@@ -1017,21 +1035,23 @@ class UserManagementTest extends TestCase
             ->assertJsonPath('usuario.id_usuario', $user->id_usuario);
     }
 
-    public function test_only_configured_proxy_ip_can_supply_client_ip_for_login_limit(): void
+    public function test_browser_limit_follows_cookie_when_ip_changes(): void
     {
+        $this->withCredentials();
         $user = User::factory()->create([
             'nombre_usuario' => 'USUARIO.PROXY',
         ]);
 
-        config()->set('trustedproxy.proxies', ['192.0.2.50']);
         config()->set('sanctum.stateful', ['localhost']);
         $this->withHeaders([
             'Origin' => 'http://localhost',
             'Referer' => 'http://localhost/',
-        ])->withServerVariables(['REMOTE_ADDR' => '192.0.2.50']);
+        ]);
 
+        $browserCookie = null;
         for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $response = $this->withHeader('X-Forwarded-For', '198.51.100.50')
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
+                ->withServerVariables(['REMOTE_ADDR' => "192.0.2.{$attempt}"])
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
                     'password' => 'Password123',
@@ -1040,23 +1060,156 @@ class UserManagementTest extends TestCase
             $attempt < 5
                 ? $response->assertUnauthorized()
                 : $this->assertLoginRateLimited($response);
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
         }
 
         $this->assertLoginRateLimited(
-            $this->withHeader('X-Forwarded-For', '198.51.100.50')
+            $this->withCookie('pizzerp_login_browser', $browserCookie)
+                ->withServerVariables(['REMOTE_ADDR' => '192.0.2.99'])
                 ->postJson('/api/login', [
                     'username' => 'USUARIO.PROXY',
                     'password' => 'Password123',
                 ])
         );
 
-        $this->withHeader('X-Forwarded-For', '198.51.100.51')
+        $this->withCookie('pizzerp_login_browser', '')
+            ->withServerVariables(['REMOTE_ADDR' => '192.0.2.99'])
             ->postJson('/api/login', [
                 'username' => 'USUARIO.PROXY',
                 'password' => 'Password123',
             ])
             ->assertOk()
             ->assertJsonPath('usuario.id_usuario', $user->id_usuario);
+    }
+
+    public function test_successful_login_clears_only_its_browser_failure_count(): void
+    {
+        $this->withCredentials();
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeader('Origin', 'http://localhost');
+        $user = User::factory()->create();
+        $browserCookie = '';
+
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
+                ->postJson('/api/login', [
+                    'username' => 'NO.EXISTE',
+                    'password' => 'Password123',
+                ])->assertUnauthorized();
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
+        }
+
+        $this->withCookie('pizzerp_login_browser', $browserCookie)
+            ->postJson('/api/login', [
+                'username' => $user->nombre_usuario,
+                'password' => 'Password123',
+            ])->assertOk();
+
+        for ($attempt = 1; $attempt <= 4; $attempt++) {
+            $this->withCookie('pizzerp_login_browser', $browserCookie)
+                ->postJson('/api/login', [
+                    'username' => 'NO.EXISTE',
+                    'password' => 'Password123',
+                ])->assertUnauthorized();
+        }
+
+        $this->assertLoginRateLimited($this->withCookie('pizzerp_login_browser', $browserCookie)
+            ->postJson('/api/login', [
+                'username' => 'NO.EXISTE',
+                'password' => 'Password123',
+            ]));
+        $this->assertSame(0, $user->fresh()->intentos_fallidos);
+    }
+
+    public function test_deleting_browser_cookie_does_not_clear_account_lock(): void
+    {
+        $this->withCredentials();
+        $user = User::factory()->create();
+
+        for ($attempt = 1; $attempt <= 5; $attempt++) {
+            $this->withCookie('pizzerp_login_browser', '')
+                ->postJson('/api/login', [
+                    'username' => $user->nombre_usuario,
+                    'password' => 'WrongPassword456',
+                ])->assertUnauthorized();
+        }
+
+        $this->assertSame(5, $user->fresh()->intentos_fallidos);
+        $this->assertTrue($user->fresh()->bloqueado_hasta->isFuture());
+        $this->withCookie('pizzerp_login_browser', '')
+            ->postJson('/api/login', [
+                'username' => $user->nombre_usuario,
+                'password' => 'Password123',
+            ])->assertUnauthorized()->assertExactJson([
+                'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+            ]);
+    }
+
+    public function test_forged_browser_cookie_gets_new_identity_without_clearing_original_limit(): void
+    {
+        $this->withCredentials();
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeader('Origin', 'http://localhost');
+        $user = User::factory()->create();
+        $browserCookie = '';
+
+        for ($attempt = 1; $attempt <= 5; $attempt++) {
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
+                ->postJson('/api/login', [
+                    'username' => 'NO.EXISTE',
+                    'password' => 'Password123',
+                ]);
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
+        }
+        $this->assertLoginRateLimited($response);
+
+        $forged = $this->withCookie('pizzerp_login_browser', str_repeat('a', 64).'.'.str_repeat('b', 64))
+            ->postJson('/api/login', [
+                'username' => $user->nombre_usuario,
+                'password' => 'Password123',
+            ])->assertOk();
+        $this->assertNotSame($browserCookie, $forged->getCookie('pizzerp_login_browser')->getValue());
+        $this->assertLoginRateLimited($this->withCookie('pizzerp_login_browser', $browserCookie)
+            ->postJson('/api/login', [
+                'username' => 'NO.EXISTE',
+                'password' => 'Password123',
+            ]));
+    }
+
+    public function test_missing_wrong_inactive_and_blocked_logins_all_count_on_one_browser(): void
+    {
+        $this->withCredentials();
+        config()->set('sanctum.stateful', ['localhost']);
+        $this->withHeader('Origin', 'http://localhost');
+        $wrongPasswordUser = User::factory()->create();
+        $inactiveUser = User::factory()->inactive()->create();
+        $blockedUser = User::factory()->create([
+            'intentos_fallidos' => 5,
+            'bloqueado_hasta' => now()->addMinutes(5),
+        ]);
+        $browserCookie = '';
+        $attempts = [
+            ['NO.EXISTE', 'Password123'],
+            [$wrongPasswordUser->nombre_usuario, 'WrongPassword456'],
+            [$inactiveUser->nombre_usuario, 'Password123'],
+            [$blockedUser->nombre_usuario, 'Password123'],
+            ['OTRO.INEXISTENTE', 'Password123'],
+        ];
+
+        foreach ($attempts as $index => [$username, $password]) {
+            $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
+                ->postJson('/api/login', compact('username', 'password'));
+            $index === 4
+                ? $this->assertLoginRateLimited($response)
+                : $response->assertUnauthorized()->assertExactJson([
+                    'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
+                ]);
+            $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
+        }
+
+        $this->assertSame(1, $wrongPasswordUser->fresh()->intentos_fallidos);
+        $this->assertSame(0, $inactiveUser->fresh()->intentos_fallidos);
+        $this->assertSame(5, $blockedUser->fresh()->intentos_fallidos);
     }
 
     public function test_inactive_user_cannot_retrieve_authenticated_user(): void

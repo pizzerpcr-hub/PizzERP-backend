@@ -13,7 +13,6 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\RateLimiter;
 
 class AuthController extends Controller
 {
@@ -21,27 +20,44 @@ class AuthController extends Controller
 
     private const LOCK_MINUTES = 5;
 
-    private const MAX_IP_FAILED_ATTEMPTS = 5;
+    private const BROWSER_COOKIE = 'pizzerp_login_browser';
 
-    private const IP_LIMIT_SECONDS = 300;
+    private const MAX_BROWSER_FAILED_ATTEMPTS = 5;
+
+    private const BROWSER_LOCK_SECONDS = 300;
 
     public function login(LoginRequest $request): JsonResponse
     {
-        $ipLimitKey = 'login:ip:'.hash('sha256', (string) $request->ip());
+        $browserId = $this->browserId($request);
+        $browserKey = 'login:browser:'.$browserId;
 
         try {
-            return Cache::store(config('cache.limiter'))
-                ->lock($ipLimitKey.':lock', 30)
-                ->block(10, fn (): JsonResponse => $this->attemptLogin($request, $ipLimitKey));
+            $response = Cache::store(config('cache.limiter'))
+                ->lock($browserKey.':lock', 30)
+                ->block(10, fn (): JsonResponse => $this->attemptLogin($request, $browserKey));
         } catch (LockTimeoutException) {
-            return $this->failedLoginResponse();
+            $response = $this->failedLoginResponse();
         }
+
+        return $response->withCookie(cookie(
+            self::BROWSER_COOKIE,
+            $browserId.'.'.hash_hmac('sha256', $browserId, config('app.key')),
+            60 * 24 * 365,
+            '/',
+            null,
+            $request->isSecure() || config('session.secure') === true,
+            true,
+            false,
+            'lax'
+        ));
     }
 
-    private function attemptLogin(LoginRequest $request, string $ipLimitKey): JsonResponse
+    private function attemptLogin(LoginRequest $request, string $browserKey): JsonResponse
     {
-        if (RateLimiter::tooManyAttempts($ipLimitKey, self::MAX_IP_FAILED_ATTEMPTS)) {
-            return $this->tooManyAttemptsResponse($ipLimitKey);
+        $remaining = Cache::store(config('cache.limiter'))->get($browserKey.':blocked_until');
+
+        if (is_int($remaining) && $remaining > now()->timestamp) {
+            return $this->tooManyAttemptsResponse($remaining);
         }
 
         $data = $request->validated();
@@ -52,7 +68,7 @@ class AuthController extends Controller
             ->first();
 
         if (! $user) {
-            return $this->failedLoginResponse($ipLimitKey);
+            return $this->failedLoginResponse($browserKey);
         }
 
         if (
@@ -66,13 +82,13 @@ class AuthController extends Controller
                 'La cuenta permanece bloqueada temporalmente.'
             );
 
-            return $this->failedLoginResponse($ipLimitKey);
+            return $this->failedLoginResponse($browserKey);
         }
 
         if (! Hash::check($data['password'], $user->contrasena_hash)) {
             $this->registerFailedAttempt($user);
 
-            return $this->failedLoginResponse($ipLimitKey);
+            return $this->failedLoginResponse($browserKey);
         }
 
         if (mb_strtoupper($user->estado) !== 'ACTIVO') {
@@ -83,7 +99,7 @@ class AuthController extends Controller
                 'El estado del usuario no permite iniciar sesión.'
             );
 
-            return $this->failedLoginResponse($ipLimitKey);
+            return $this->failedLoginResponse($browserKey);
         }
 
         if (
@@ -109,6 +125,7 @@ class AuthController extends Controller
         );
 
         $request->session()->regenerate();
+        Cache::store(config('cache.limiter'))->forget($browserKey.':attempts');
 
         return response()->json([
             'message' => 'Inicio de sesión exitoso.',
@@ -217,19 +234,24 @@ class AuthController extends Controller
 
     /*
      * Respuesta genérica de credenciales inválidas.
-     * Si viene un $ipLimitKey, registra el intento fallido contra
-     * la IP y, si con este intento se alcanzó el límite, devuelve
-     * en su lugar la respuesta de "demasiados intentos" con el
-     * conteo regresivo — sin revelar nada sobre la cuenta puntual.
+     * Los fallos se acumulan para el navegador hasta un login correcto
+     * o el vencimiento del bloqueo iniciado por el quinto fallo.
      */
-    private function failedLoginResponse(?string $ipLimitKey = null): JsonResponse
+    private function failedLoginResponse(?string $browserKey = null): JsonResponse
     {
-        if ($ipLimitKey !== null) {
-            RateLimiter::hit($ipLimitKey, self::IP_LIMIT_SECONDS);
+        if ($browserKey !== null) {
+            $cache = Cache::store(config('cache.limiter'));
+            $attempts = (int) $cache->get($browserKey.':attempts', 0) + 1;
 
-            if (RateLimiter::tooManyAttempts($ipLimitKey, self::MAX_IP_FAILED_ATTEMPTS)) {
-                return $this->tooManyAttemptsResponse($ipLimitKey);
+            if ($attempts >= self::MAX_BROWSER_FAILED_ATTEMPTS) {
+                $cache->forget($browserKey.':attempts');
+                $blockedUntil = now()->timestamp + self::BROWSER_LOCK_SECONDS;
+                $cache->put($browserKey.':blocked_until', $blockedUntil, self::BROWSER_LOCK_SECONDS);
+
+                return $this->tooManyAttemptsResponse($blockedUntil);
             }
+
+            $cache->forever($browserKey.':attempts', $attempts);
         }
 
         return response()->json([
@@ -238,18 +260,31 @@ class AuthController extends Controller
     }
 
     /*
-     * Respuesta cuando se excedió el límite de intentos por IP.
+     * Respuesta cuando se excedió el límite de intentos por navegador.
      * No menciona si la cuenta existe, está bloqueada o inactiva:
      * el mensaje es igual para cualquier motivo de fallo previo.
      */
-    private function tooManyAttemptsResponse(string $ipLimitKey): JsonResponse
+    private function tooManyAttemptsResponse(int $blockedUntil): JsonResponse
     {
-        $segundosRestantes = RateLimiter::availableIn($ipLimitKey);
+        $segundosRestantes = max(1, $blockedUntil - now()->timestamp);
 
         return response()->json([
             'message' => "Se alcanzó el limite de intentos.\n",
             'retry_after' => $segundosRestantes,
         ], 429);
+    }
+
+    private function browserId(Request $request): string
+    {
+        $cookie = $request->cookie(self::BROWSER_COOKIE);
+
+        if (is_string($cookie) && preg_match('/^([a-f0-9]{64})\.([a-f0-9]{64})$/D', $cookie, $matches)) {
+            if (hash_equals(hash_hmac('sha256', $matches[1], config('app.key')), $matches[2])) {
+                return $matches[1];
+            }
+        }
+
+        return bin2hex(random_bytes(32));
     }
 
     private function recordAudit(
