@@ -2,7 +2,7 @@ FROM php:8.4-apache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git unzip supervisor libpq-dev libzip-dev libonig-dev libicu-dev \
-    && docker-php-ext-install pdo_pgsql pgsql mbstring bcmath intl zip opcache \
+    && docker-php-ext-install pdo_pgsql pgsql mbstring bcmath intl zip opcache pcntl \
     && a2enmod rewrite proxy proxy_http \
     && rm -rf /var/lib/apt/lists/*
 
