@@ -2,11 +2,13 @@
 
 namespace App\Events;
 
+use Illuminate\Broadcasting\PrivateChannel;
 use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
 use Illuminate\Contracts\Broadcasting\ShouldRescue;
 use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
+
 
 class UserStatus implements ShouldBroadcast, ShouldDispatchAfterCommit, ShouldRescue
 {
@@ -29,8 +31,9 @@ class UserStatus implements ShouldBroadcast, ShouldDispatchAfterCommit, ShouldRe
 
     public function broadcastOn(): array
     {
-        // Retired channel: also suppress jobs serialized before publication was removed.
-        return [];
+        return [
+            new PrivateChannel('usuario.'.$this->usuario['id_usuario']),
+        ];
     }
 
     public function broadcastAs(): string

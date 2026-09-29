@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\UserStatus;
 use App\Models\Bitacora;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -321,6 +322,7 @@ class UserController extends Controller
                     "Estado del usuario {$lockedUser->nombre_usuario} (ID {$lockedUser->id_usuario}) actualizado.",
                     "Estado anterior: {$previousStatus}; estado nuevo: {$lockedUser->estado}."
                 );
+                UserStatus::dispatch($this->userPayload($lockedUser));
             }
 
             return $lockedUser;

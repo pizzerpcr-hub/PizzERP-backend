@@ -1,3 +1,9 @@
 <?php
 
-// User data is retrieved through the protected API; the usuarios channel is retired.
+use App\Models\User;
+use Illuminate\Support\Facades\Broadcast;
+
+Broadcast::channel('usuario.{id}', function (User $user, string $id): bool {
+    return (string) $user->getKey() === $id
+        && $user->estado === 'ACTIVO';
+});
