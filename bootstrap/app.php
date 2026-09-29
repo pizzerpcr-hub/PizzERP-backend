@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Middleware\EnsureSessionIsCurrent;
 use App\Http\Middleware\EnsureUserIsActive;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -13,7 +14,7 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withBroadcasting(__DIR__.'/../routes/channels.php', [
-        'middleware' => ['web', 'auth:sanctum', 'user.active'],
+        'middleware' => ['web', 'auth:sanctum', 'session.current', 'user.active'],
     ])
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->statefulApi();
@@ -24,6 +25,7 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->alias([
             'user.active' => EnsureUserIsActive::class,
+            'session.current' => EnsureSessionIsCurrent::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

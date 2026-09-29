@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Middleware\EnsureSessionIsCurrent;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Models\Bitacora;
 use App\Models\User;
@@ -11,6 +12,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Cookie;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 
@@ -119,12 +121,21 @@ class AuthController extends Controller
             'Las credenciales fueron verificadas correctamente.'
         );
 
-        Auth::guard('web')->login(
-            $user,
-            $request->boolean('remember')
-        );
+        $remember = $request->boolean('remember');
+        $guard = Auth::guard('web');
+        $guard->setRememberDuration(EnsureSessionIsCurrent::REMEMBER_DAYS * 1440);
+        $guard->login($user, $remember);
 
         $request->session()->regenerate();
+        EnsureSessionIsCurrent::startSession($request, $user, $remember);
+
+        if ($remember) {
+            Cookie::queue(EnsureSessionIsCurrent::grantCookie($user));
+        } else {
+            Cookie::queue(Cookie::forget($guard->getRecallerName(), config('session.path'), config('session.domain')));
+            Cookie::queue(Cookie::forget(EnsureSessionIsCurrent::GRANT_COOKIE, config('session.path'), config('session.domain')));
+        }
+
         Cache::store(config('cache.limiter'))->forget($browserKey.':attempts');
 
         return response()->json([
@@ -160,6 +171,7 @@ class AuthController extends Controller
 
         $request->session()->invalidate();
         $request->session()->regenerateToken();
+        Cookie::queue(Cookie::forget(EnsureSessionIsCurrent::GRANT_COOKIE, config('session.path'), config('session.domain')));
 
         return response()->json([
             'message' => 'Sesión cerrada correctamente.',

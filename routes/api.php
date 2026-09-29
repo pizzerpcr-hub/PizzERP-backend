@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\Route;
 Route::post('/login', [AuthController::class, 'login'])
     ->name('auth.login');
 
-Route::middleware('auth:sanctum')->group(function (): void {
+Route::middleware(['auth:sanctum', 'session.current'])->group(function (): void {
     Route::post('/logout', [AuthController::class, 'logout'])
         ->name('auth.logout');
 

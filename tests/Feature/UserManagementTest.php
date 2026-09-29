@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Events\UserChanged;
 use App\Events\UserCreated;
 use App\Events\UserStatus;
+use App\Http\Middleware\EnsureSessionIsCurrent;
 use App\Models\Bitacora;
 use App\Models\User;
 use Illuminate\Broadcasting\Broadcasters\NullBroadcaster;
@@ -155,10 +156,15 @@ class UserManagementTest extends TestCase
             'username' => $user->nombre_usuario, 'password' => 'Password123',
         ])->assertOk();
         $sessionId = $login->getCookie($cookieName)->getValue();
-        $this->actingAs($actor, 'web')->patchJson("/api/users/{$user->id_usuario}", [
-            'nombre_completo' => $user->nombre_completo,
-            'nombre_usuario' => $user->nombre_usuario, 'rol' => $newRole,
+        auth()->forgetGuards();
+        $actorLogin = $this->withCookie($cookieName, '')->postJson('/api/login', [
+            'username' => $actor->nombre_usuario, 'password' => 'Password123',
         ])->assertOk();
+        $this->withCookie($cookieName, $actorLogin->getCookie($cookieName)->getValue())
+            ->patchJson("/api/users/{$user->id_usuario}", [
+                'nombre_completo' => $user->nombre_completo,
+                'nombre_usuario' => $user->nombre_usuario, 'rol' => $newRole,
+            ])->assertOk();
         auth()->forgetGuards();
         $this->withCookie($cookieName, $sessionId)->getJson('/api/user')
             ->assertOk()->assertJsonPath('usuario.rol', $newRole);
@@ -184,9 +190,14 @@ class UserManagementTest extends TestCase
             'username' => $user->nombre_usuario, 'password' => 'Password123',
         ])->assertOk();
         $sessionId = $login->getCookie($cookieName)->getValue();
-        $this->actingAs($actor, 'web')->patchJson("/api/users/{$user->id_usuario}/estado", [
-            'estado' => 'INACTIVO',
+        auth()->forgetGuards();
+        $actorLogin = $this->withCookie($cookieName, '')->postJson('/api/login', [
+            'username' => $actor->nombre_usuario, 'password' => 'Password123',
         ])->assertOk();
+        $this->withCookie($cookieName, $actorLogin->getCookie($cookieName)->getValue())
+            ->patchJson("/api/users/{$user->id_usuario}/estado", [
+                'estado' => 'INACTIVO',
+            ])->assertOk();
         foreach (['/api/user', '/api/users'] as $uri) {
             auth()->forgetGuards();
             $this->withCookie($cookieName, $sessionId)->getJson($uri)->assertForbidden()
@@ -213,6 +224,7 @@ class UserManagementTest extends TestCase
         $this->withCookie($rememberName, $rememberCookie)
             ->withCookie($cookieName, $sessionId)->postJson('/api/logout')
             ->assertOk()->assertCookieExpired($rememberName)
+            ->assertCookieExpired(EnsureSessionIsCurrent::GRANT_COOKIE)
             ->assertExactJson(['message' => 'Sesión cerrada correctamente.']);
 
         foreach (['/api/user', '/api/users'] as $uri) {
@@ -221,6 +233,179 @@ class UserManagementTest extends TestCase
                 ->get($uri, ['Accept' => 'text/html'])
                 ->assertUnauthorized()->assertHeader('Content-Type', 'application/json');
         }
+    }
+
+    public function test_login_without_remember_uses_a_session_cookie_and_expires_after_inactivity(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $rememberName = auth('web')->getRecallerName();
+
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => false,
+        ])->assertOk();
+
+        $sessionId = $login->getCookie($cookieName)->getValue();
+        $this->assertSame(0, $login->getCookie($cookieName)->getExpiresTime());
+        $login->assertCookieExpired($rememberName)
+            ->assertCookieExpired(EnsureSessionIsCurrent::GRANT_COOKIE);
+
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->getJson('/api/user')->assertOk();
+
+        $this->travel(EnsureSessionIsCurrent::IDLE_MINUTES + 1)->minutes();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->getJson('/api/users')
+            ->assertUnauthorized()->assertExactJson(['message' => 'Unauthenticated.']);
+    }
+
+    public function test_expired_session_can_still_log_out_and_cannot_access_protected_routes(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => false,
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+
+        $this->travel(EnsureSessionIsCurrent::IDLE_MINUTES + 1)->minutes();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->postJson('/api/logout')
+            ->assertOk()->assertCookieExpired(EnsureSessionIsCurrent::GRANT_COOKIE);
+
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->getJson('/api/user')->assertUnauthorized();
+    }
+
+    public function test_activity_extends_a_non_remembered_session_and_reload_does_not_log_out(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => false,
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+
+        foreach ([20, 20] as $minutes) {
+            $this->travel($minutes)->minutes();
+            auth()->forgetGuards();
+            app('session')->driver()->flush();
+            $this->withCookie($cookieName, $sessionId)->getJson('/api/user')->assertOk();
+        }
+    }
+
+    public function test_remembered_login_can_restore_an_expired_session_but_not_after_fourteen_days(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $rememberName = auth('web')->getRecallerName();
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => true,
+        ])->assertOk();
+        $rememberCookie = $login->getCookie($rememberName)->getValue();
+        $grantCookie = $login->getCookie(EnsureSessionIsCurrent::GRANT_COOKIE)->getValue();
+
+        $this->assertSame(0, $login->getCookie($cookieName)->getExpiresTime());
+        $this->assertGreaterThan(now()->addDays(13)->timestamp, $login->getCookie($rememberName)->getExpiresTime());
+        $this->assertGreaterThan(now()->addDays(13)->timestamp, $login->getCookie(EnsureSessionIsCurrent::GRANT_COOKIE)->getExpiresTime());
+
+        $this->travel(121)->minutes();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, '')
+            ->withCookie($rememberName, $rememberCookie)
+            ->withCookie(EnsureSessionIsCurrent::GRANT_COOKIE, $grantCookie)
+            ->getJson('/api/user')->assertOk();
+
+        $this->travel(EnsureSessionIsCurrent::REMEMBER_DAYS)->days();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, '')
+            ->withCookie($rememberName, $rememberCookie)
+            ->withCookie(EnsureSessionIsCurrent::GRANT_COOKIE, $grantCookie)
+            ->getJson('/api/user')->assertUnauthorized();
+    }
+
+    public function test_remember_cookie_without_server_verifiable_grant_cannot_restore_session(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $rememberName = auth('web')->getRecallerName();
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => true,
+        ])->assertOk();
+        $rememberCookie = $login->getCookie($rememberName)->getValue();
+
+        $this->travel(121)->minutes();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, 'missing-session')
+            ->withCookie($rememberName, $rememberCookie)
+            ->withCookie(EnsureSessionIsCurrent::GRANT_COOKIE, 'invalid')
+            ->getJson('/api/user')->assertUnauthorized();
+    }
+
+    public function test_private_channel_authorization_rejects_expired_session(): void
+    {
+        $this->configureBroadcastAuth();
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $login = $this->postJson('/api/login', [
+            'username' => $user->nombre_usuario, 'password' => 'Password123', 'remember' => false,
+        ])->assertOk();
+        $sessionId = $login->getCookie($cookieName)->getValue();
+
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456', 'channel_name' => 'private-usuario.'.$user->id_usuario,
+        ])->assertOk();
+
+        $this->travel(EnsureSessionIsCurrent::IDLE_MINUTES + 1)->minutes();
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $this->withCookie($cookieName, $sessionId)->postJson('/broadcasting/auth', [
+            'socket_id' => '123.456', 'channel_name' => 'private-usuario.'.$user->id_usuario,
+        ])->assertUnauthorized();
+    }
+
+    public function test_login_without_remember_removes_previous_remember_cookies(): void
+    {
+        config(['sanctum.stateful' => ['localhost']]);
+        $this->withHeader('Origin', 'http://localhost')->withCredentials();
+        $user = User::factory()->create(['rol' => 'TI']);
+        $cookieName = config('session.cookie');
+        $rememberName = auth('web')->getRecallerName();
+        $credentials = ['username' => $user->nombre_usuario, 'password' => 'Password123'];
+
+        $remembered = $this->postJson('/api/login', $credentials + ['remember' => true])->assertOk();
+        $this->assertNotNull($remembered->getCookie($rememberName));
+
+        auth()->forgetGuards();
+        app('session')->driver()->flush();
+        $ordinary = $this->withCookie($cookieName, '')
+            ->postJson('/api/login', $credentials + ['remember' => false])
+            ->assertOk();
+
+        $ordinary->assertCookieExpired($rememberName)
+            ->assertCookieExpired(EnsureSessionIsCurrent::GRANT_COOKIE);
+        $this->assertSame(0, $ordinary->getCookie($cookieName)->getExpiresTime());
     }
 
     public function test_registration_requires_all_four_fields_without_writing_an_audit(): void
@@ -377,7 +562,11 @@ class UserManagementTest extends TestCase
             ['id_usuario', 'nombre_completo', 'nombre_usuario', 'rol', 'estado'],
             array_keys($response->json('usuario'))
         );
-        Queue::assertNothingPushed();
+        if ($action === 'status') {
+            Queue::assertPushed(BroadcastEvent::class, 1);
+        } else {
+            Queue::assertNothingPushed();
+        }
     }
 
     public function test_ti_session_can_be_restored_and_list_users(): void
@@ -498,7 +687,7 @@ class UserManagementTest extends TestCase
     #[TestWith([UserCreated::class])]
     #[TestWith([UserChanged::class])]
     #[TestWith([UserStatus::class])]
-    public function test_retired_user_event_has_safe_payload_but_no_destinations(string $eventClass): void
+    public function test_user_event_has_safe_payload_and_only_status_targets_the_user(string $eventClass): void
     {
         $public = [
             'id_usuario' => 10,
@@ -517,13 +706,16 @@ class UserManagementTest extends TestCase
 
         $this->assertSame(['usuario' => $public], $event->broadcastWith());
         $this->assertSame($public, $event->usuario);
-        $this->assertSame([], $event->broadcastOn());
+        $this->assertSame(
+            $eventClass === UserStatus::class ? ['private-usuario.10'] : [],
+            array_map(fn ($channel) => $channel->name, $event->broadcastOn())
+        );
     }
 
     #[TestWith(['create', UserCreated::class])]
     #[TestWith(['update', UserChanged::class])]
     #[TestWith(['status', UserStatus::class])]
-    public function test_user_mutation_does_not_queue_event_even_after_outer_commit(
+    public function test_user_mutation_queues_only_status_event_after_outer_commit(
         string $action,
         string $eventClass
     ): void {
@@ -537,8 +729,15 @@ class UserManagementTest extends TestCase
         Queue::assertNothingPushed();
         DB::commit();
 
-        $this->assertSame([], (new $eventClass($response->json('usuario')))->broadcastOn());
-        Queue::assertNothingPushed();
+        $this->assertSame(
+            $action === 'status' ? ['private-usuario.'.$user->id_usuario] : [],
+            array_map(fn ($channel) => $channel->name, (new $eventClass($response->json('usuario')))->broadcastOn())
+        );
+        if ($action === 'status') {
+            Queue::assertPushed(BroadcastEvent::class, 1);
+        } else {
+            Queue::assertNothingPushed();
+        }
         $this->assertDatabaseCount('bitacoras', 1);
     }
 
