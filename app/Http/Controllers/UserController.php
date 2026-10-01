@@ -425,7 +425,7 @@ class UserController extends Controller
             'nombre_completo.max' => 'El nombre completo no puede superar 100 caracteres.',
             'nombre_usuario.required' => 'El nombre de usuario es obligatorio.',
             'nombre_usuario.max' => 'El nombre de usuario no puede superar 50 caracteres.',
-            'nombre_usuario.unique' => 'El nombre de usuario ya está registrado.',
+            'nombre_usuario.unique' => 'Usuario existente.',
             'contrasena.required' => 'La contraseña es obligatoria.',
             'contrasena.min' => 'La contraseña debe tener al menos 8 caracteres.',
             'rol.required' => 'El rol es obligatorio.',

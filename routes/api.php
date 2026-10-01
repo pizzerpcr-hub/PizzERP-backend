@@ -1,6 +1,9 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\CategoriaController;
+use App\Http\Controllers\IngredienteController;
+use App\Http\Controllers\ProductoController;
 use App\Http\Controllers\UserController;
 use Illuminate\Support\Facades\Route;
 
@@ -28,5 +31,16 @@ Route::middleware(['auth:sanctum', 'session.current'])->group(function (): void 
             '/users/{user}/estado',
             [UserController::class, 'updateStatus']
         )->name('users.update-status');
+
+        Route::apiResource('ingredients', IngredienteController::class)
+            ->parameters(['ingredients' => 'ingrediente']);
+
+        Route::apiResource('categories', CategoriaController::class)
+            ->only(['index', 'store', 'update'])
+            ->parameters(['categories' => 'categoria']);
+
+        Route::apiResource('products', ProductoController::class)
+            ->only(['index', 'store', 'update'])
+            ->parameters(['products' => 'producto']);
     });
 });
