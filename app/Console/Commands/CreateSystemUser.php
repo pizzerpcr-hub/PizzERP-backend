@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Models\Rol;
 use App\Models\User;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Validator;
@@ -16,6 +17,12 @@ class CreateSystemUser extends Command
 
     public function handle(): int
     {
+        $roles = Rol::query()->where('estado', 'ACTIVO')->orderBy('nombre')->pluck('nombre')->all();
+        if ($roles === []) {
+            $this->error('No hay roles activos disponibles.');
+
+            return self::FAILURE;
+        }
         $nombreCompleto = trim(
             (string) $this->ask('Nombre completo')
         );
@@ -26,7 +33,7 @@ class CreateSystemUser extends Command
         ));
 
         $rol = mb_strtoupper(trim(
-            (string) $this->choice('Rol', User::ROLES, 'ADMINISTRADOR')
+            (string) $this->choice('Rol', $roles, $roles[0])
         ));
 
         $password = (string) $this->secret(
@@ -62,7 +69,7 @@ class CreateSystemUser extends Command
             ],
             'rol' => [
                 'required',
-                Rule::in(User::ROLES),
+                Rule::in($roles),
             ],
             'password' => [
                 'required',
@@ -78,7 +85,7 @@ class CreateSystemUser extends Command
             'nombre_usuario.max' => 'El nombre de usuario no puede superar 50 caracteres.',
             'nombre_usuario.unique' => 'El nombre de usuario ya está registrado.',
             'rol.required' => 'El rol es obligatorio.',
-            'rol.in' => 'El rol debe ser ADMINISTRADOR, CAJA, COCINA o TI.',
+            'rol.in' => 'Seleccione un rol activo disponible.',
             'password.required' => 'La contraseña es obligatoria.',
             'password.min' => 'La contraseña debe tener al menos 8 caracteres.',
             'password.regex' => 'La contraseña debe contener letras y números.',

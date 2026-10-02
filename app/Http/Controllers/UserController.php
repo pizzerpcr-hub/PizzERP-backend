@@ -4,7 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Events\UserStatus;
 use App\Models\Bitacora;
+use App\Models\Rol;
 use App\Models\User;
+use App\Services\ManagementAccess;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -14,9 +17,17 @@ use Illuminate\Validation\ValidationException;
 
 class UserController extends Controller
 {
-    private const ADMINISTRATOR_ROLE = 'ADMINISTRADOR';
+    public function assignableRoles(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (! $user instanceof User || (! $user->hasModulePermission('usuarios', 'crear')
+            && ! $user->hasModulePermission('usuarios', 'editar'))) {
+            abort(403, 'No tiene permiso para asignar roles.');
+        }
 
-    private const ALLOWED_ROLES = User::ROLES;
+        return response()->json(['roles' => Rol::query()->where('estado', 'ACTIVO')
+            ->orderBy('nombre')->get(['nombre', 'estado'])]);
+    }
 
     private const ALLOWED_STATUSES = [
         'ACTIVO',
@@ -33,7 +44,7 @@ class UserController extends Controller
 
     public function store(Request $request): JsonResponse
     {
-        $administrator = $this->authenticatedUserManager($request);
+        $this->authenticatedUserManager($request);
 
         $request->merge([
             'nombre_completo' => trim(
@@ -50,40 +61,40 @@ class UserController extends Controller
             )),
         ]);
 
-        $data = $request->validate([
-            'nombre_completo' => [
-                'required',
-                'string',
-                'max:100',
-            ],
-            'nombre_usuario' => [
-                'bail',
-                'required',
-                'string',
-                'max:50',
-                'unique:usuarios,nombre_usuario',
-            ],
-            'contrasena' => [
-                'required',
-                'string',
-                Password::min(8)
-                    ->letters()
-                    ->numbers(),
-            ],
-            'rol' => [
-                'required',
-                Rule::in(self::ALLOWED_ROLES),
-            ],
-            'estado' => [
-                'required',
-                Rule::in(self::ALLOWED_STATUSES),
-            ],
-        ], $this->validationMessages());
+        $user = DB::transaction(function () use ($request): User {
+            [$administrator, $roles] = $this->lockRolesAndAuthorize($request, 'usuarios');
+            $data = $request->validate([
+                'nombre_completo' => [
+                    'required',
+                    'string',
+                    'max:100',
+                ],
+                'nombre_usuario' => [
+                    'bail',
+                    'required',
+                    'string',
+                    'max:50',
+                    'unique:usuarios,nombre_usuario',
+                ],
+                'contrasena' => [
+                    'required',
+                    'string',
+                    Password::min(8)
+                        ->letters()
+                        ->numbers(),
+                ],
+                'rol' => [
+                    'required',
+                    'string',
+                    'max:30',
+                    $this->assignedRoleRule($administrator, $roles),
+                ],
+                'estado' => [
+                    'required',
+                    Rule::in(self::ALLOWED_STATUSES),
+                ],
+            ], $this->validationMessages());
 
-        $user = DB::transaction(function () use (
-            $administrator,
-            $data
-        ): User {
             $user = User::create([
                 'nombre_completo' => $data['nombre_completo'],
                 'nombre_usuario' => $data['nombre_usuario'],
@@ -127,7 +138,7 @@ class UserController extends Controller
 
     public function update(Request $request): JsonResponse
     {
-        $administrator = $this->authenticatedUserManager($request);
+        $this->authenticatedUserManager($request);
         $userId = $request->route('user');
 
         $request->merge([
@@ -143,24 +154,19 @@ class UserController extends Controller
         ]);
 
         $updatedUser = DB::transaction(function () use (
-            $administrator,
             $request,
             $userId
         ): User {
-            $activeAdministratorCount = null;
-
-            if (
-                $request->input('rol') !== self::ADMINISTRATOR_ROLE
-                && in_array($request->input('rol'), self::ALLOWED_ROLES, true)
-            ) {
-                $activeAdministratorCount =
-                    $this->lockAndCountActiveAdministrators();
-            }
+            [$administrator, $roles] = $this->lockRolesAndAuthorize($request, 'usuarios');
 
             $lockedUser = User::query()
                 ->whereKey($userId)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $lockedUser->setRelation('assignedRole', $roles->firstWhere('nombre', $lockedUser->rol));
+            $wasManager = $lockedUser->estado === 'ACTIVO' && ($lockedUser->assignedRole?->grantsManagement() ?? false);
+            $this->authorizeManagedAccount($administrator, $lockedUser);
 
             $usernameRules = ['bail', 'required', 'string', 'max:50'];
 
@@ -178,7 +184,9 @@ class UserController extends Controller
                 'nombre_usuario' => $usernameRules,
                 'rol' => [
                     'required',
-                    Rule::in(self::ALLOWED_ROLES),
+                    'string',
+                    'max:30',
+                    $this->assignedRoleRule($administrator, $roles),
                 ],
                 'contrasena' => [
                     'nullable',
@@ -192,17 +200,6 @@ class UserController extends Controller
 
             $passwordWasProvided = isset($data['contrasena'])
                 && $data['contrasena'] !== '';
-
-            if (
-                $lockedUser->rol === self::ADMINISTRATOR_ROLE
-                && $lockedUser->estado === 'ACTIVO'
-                && $data['rol'] !== self::ADMINISTRATOR_ROLE
-                && $activeAdministratorCount === 1
-            ) {
-                throw ValidationException::withMessages([
-                    'rol' => 'No se puede cambiar el rol del último administrador activo.',
-                ]);
-            }
 
             $lockedUser->fill([
                 'nombre_completo' => $data['nombre_completo'],
@@ -220,6 +217,10 @@ class UserController extends Controller
             );
 
             $lockedUser->save();
+
+            if ($wasManager && ! ($roles->firstWhere('nombre', $data['rol'])?->grantsManagement() ?? false)) {
+                ManagementAccess::assertManagerRemains($roles, 'rol');
+            }
 
             if ($modifiedFields !== []) {
                 $this->recordAudit(
@@ -260,21 +261,19 @@ class UserController extends Controller
         }
 
         $updatedUser = DB::transaction(function () use (
-            $administrator,
             $request,
             $userId
         ): User {
-            $activeAdministratorCount = null;
-
-            if ($request->input('estado') === 'INACTIVO') {
-                $activeAdministratorCount =
-                    $this->lockAndCountActiveAdministrators();
-            }
+            [$administrator, $roles] = $this->lockRolesAndAuthorize($request, 'usuarios');
 
             $lockedUser = User::query()
                 ->whereKey($userId)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $lockedUser->setRelation('assignedRole', $roles->firstWhere('nombre', $lockedUser->rol));
+            $wasManager = $lockedUser->estado === 'ACTIVO' && ($lockedUser->assignedRole?->grantsManagement() ?? false);
+            $this->authorizeManagedAccount($administrator, $lockedUser);
 
             $data = $request->validate([
                 'estado' => [
@@ -292,17 +291,6 @@ class UserController extends Controller
                 ]);
             }
 
-            if (
-                $data['estado'] === 'INACTIVO'
-                && $lockedUser->rol === self::ADMINISTRATOR_ROLE
-                && $lockedUser->estado === 'ACTIVO'
-                && $activeAdministratorCount === 1
-            ) {
-                throw ValidationException::withMessages([
-                    'estado' => 'No se puede desactivar al último administrador activo.',
-                ]);
-            }
-
             $previousStatus = $lockedUser->estado;
             $lockedUser->estado = $data['estado'];
 
@@ -315,6 +303,10 @@ class UserController extends Controller
             }
 
             $lockedUser->save();
+
+            if ($wasManager && $data['estado'] === 'INACTIVO') {
+                ManagementAccess::assertManagerRemains($roles, 'estado');
+            }
 
             if ($previousStatus !== $lockedUser->estado) {
                 $this->recordAudit(
@@ -336,27 +328,40 @@ class UserController extends Controller
 
     private function authenticatedUserManager(Request $request): User
     {
-        $authenticatedUser = $request->user();
-
-        if (
-            ! $authenticatedUser instanceof User
-            || ! $authenticatedUser->canManageUsers()
-        ) {
-            abort(403, 'No tiene permiso para gestionar usuarios.');
-        }
-
-        return $authenticatedUser;
+        return $this->authorizeModule($request, 'usuarios');
     }
 
-    private function lockAndCountActiveAdministrators(): int
+    private function authorizeManagedAccount(User $actor, User $target): void
     {
-        return User::query()
-            ->where('rol', self::ADMINISTRATOR_ROLE)
-            ->where('estado', 'ACTIVO')
-            ->orderBy('id_usuario')
-            ->lockForUpdate()
-            ->get(['id_usuario'])
-            ->count();
+        $permissions = $target->assignedRole?->permisos ?? Rol::emptyPermissions();
+        if (! $actor->mayDelegatePermissions($permissions)) {
+            abort(403, 'No puede gestionar una cuenta con permisos superiores a los propios.');
+        }
+    }
+
+    private function validateAssignedRole(User $actor, string $name, Collection $roles): void
+    {
+        $role = $roles->firstWhere('nombre', $name);
+        if (! $role || $role->estado !== 'ACTIVO') {
+            throw ValidationException::withMessages(['rol' => 'El rol seleccionado no es válido.']);
+        }
+        if (! $actor->mayDelegatePermissions($role->permisos)) {
+            abort(403, 'No puede asignar un rol con permisos superiores a los propios.');
+        }
+    }
+
+    private function assignedRoleRule(User $actor, Collection $roles): \Closure
+    {
+        return function (string $attribute, mixed $value, \Closure $fail) use ($actor, $roles): void {
+            if (! is_string($value)) {
+                return;
+            }
+            try {
+                $this->validateAssignedRole($actor, $value, $roles);
+            } catch (ValidationException $exception) {
+                $fail($exception->errors()['rol'][0]);
+            }
+        };
     }
 
     /**

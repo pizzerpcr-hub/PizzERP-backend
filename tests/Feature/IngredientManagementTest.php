@@ -50,6 +50,7 @@ class IngredientManagementTest extends TestCase
 
         $migration = require database_path('migrations/2026_10_01_211033_create_ingredientes_table.php');
         $migration->up();
+        (require database_path('migrations/2026_10_02_012949_create_roles_table_and_link_usuarios.php'))->up();
     }
 
     protected function tearDown(): void
@@ -57,6 +58,7 @@ class IngredientManagementTest extends TestCase
         Schema::dropIfExists('ingredientes');
         Schema::dropIfExists('bitacoras');
         Schema::dropIfExists('usuarios');
+        Schema::dropIfExists('roles');
 
         parent::tearDown();
     }

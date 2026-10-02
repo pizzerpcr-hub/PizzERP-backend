@@ -7,6 +7,7 @@ use App\Events\UserCreated;
 use App\Events\UserStatus;
 use App\Http\Middleware\EnsureSessionIsCurrent;
 use App\Models\Bitacora;
+use App\Models\Rol;
 use App\Models\User;
 use Illuminate\Broadcasting\Broadcasters\NullBroadcaster;
 use Illuminate\Broadcasting\BroadcastEvent;
@@ -422,9 +423,9 @@ class UserManagementTest extends TestCase
         $this->actingAs(User::factory()->create(['rol' => 'TI', 'nombre_usuario' => 'EXISTENTE']), 'web');
         $this->postJson('/api/users', [
             'nombre_completo' => 'Otra persona', 'nombre_usuario' => ' existente ',
-            'contrasena' => 'Password123', 'rol' => 'CAJA',
+            'contrasena' => 'Password123', 'rol' => 'TI',
         ])->assertUnprocessable()->assertJsonValidationErrors('nombre_usuario')
-            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario ya está registrado.');
+            ->assertJsonPath('errors.nombre_usuario.0', 'Usuario existente.');
         $this->assertDatabaseCount('usuarios', 1);
         $this->assertDatabaseCount('bitacoras', 0);
     }
@@ -437,7 +438,7 @@ class UserManagementTest extends TestCase
         $this->actingAs(User::factory()->create(['rol' => 'TI']), 'web');
         $this->postJson('/api/users', [
             'nombre_completo' => 'Nueva persona', 'nombre_usuario' => 'NUEVA',
-            'contrasena' => $password, 'rol' => 'CAJA',
+            'contrasena' => $password, 'rol' => 'TI',
         ])->assertUnprocessable()->assertJsonValidationErrors('contrasena');
         $this->assertDatabaseCount('usuarios', 1);
         $this->assertDatabaseCount('bitacoras', 0);
@@ -451,6 +452,7 @@ class UserManagementTest extends TestCase
     {
         $this->freezeTime();
         $actor = User::factory()->create(['rol' => 'TI']);
+        Rol::where('nombre', 'TI')->update(['permisos' => Rol::systemPermissions('ADMINISTRADOR')]);
         $this->actingAs($actor, 'web');
         $response = $this->postJson('/api/users', [
             'nombre_completo' => 'Nueva persona', 'nombre_usuario' => 'NUEVA',
@@ -549,7 +551,7 @@ class UserManagementTest extends TestCase
     public function test_active_ti_can_mutate_users_and_is_the_audit_actor(string $action): void
     {
         $actor = User::factory()->create(['rol' => 'TI']);
-        $user = User::factory()->create();
+        $user = User::factory()->create(['rol' => 'TI']);
         Queue::fake([BroadcastEvent::class]);
         $this->actingAs($actor, 'web');
 
@@ -583,6 +585,7 @@ class UserManagementTest extends TestCase
     {
         $actor = User::factory()->create(['rol' => 'TI']);
         $user = User::factory()->inactive()->create([
+            'rol' => 'TI',
             'intentos_fallidos' => 5,
             'bloqueado_hasta' => now()->addMinutes(5),
         ]);
@@ -894,12 +897,14 @@ class UserManagementTest extends TestCase
             $table->string('motivo', 255);
             $table->timestamp('fecha')->useCurrent();
         });
+        (require database_path('migrations/2026_10_02_012949_create_roles_table_and_link_usuarios.php'))->up();
     }
 
     protected function tearDown(): void
     {
         Schema::dropIfExists('bitacoras');
         Schema::dropIfExists('usuarios');
+        Schema::dropIfExists('roles');
 
         parent::tearDown();
     }
@@ -964,36 +969,45 @@ class UserManagementTest extends TestCase
         ]);
     }
 
-    public function test_login_still_blocks_after_five_failures_without_exposing_lock_details(): void
+    public function test_account_blocks_on_third_failure_without_exposing_lock_details(): void
     {
         $user = User::factory()->create([
-            'nombre_usuario' => 'QUINTO.INTENTO',
-            'intentos_fallidos' => 4,
+            'nombre_usuario' => 'TERCER.INTENTO',
         ]);
 
         $referenceResponse = $this->postJson('/api/login', [
             'username' => 'NO.EXISTE',
             'password' => 'Password123',
         ]);
-        $fifthAttemptResponse = $this->postJson('/api/login', [
-            'username' => 'QUINTO.INTENTO',
+        $this->freezeTime();
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            $this->postJson('/api/login', [
+                'username' => 'TERCER.INTENTO',
+                'password' => 'WrongPassword456',
+            ])->assertUnauthorized()->assertExactJson($referenceResponse->json());
+            $this->assertSame($attempt, $user->fresh()->intentos_fallidos);
+            $this->assertNull($user->fresh()->bloqueado_hasta);
+        }
+        $thirdAttemptResponse = $this->postJson('/api/login', [
+            'username' => 'TERCER.INTENTO',
             'password' => 'WrongPassword456',
         ]);
         $blockedResponse = $this->postJson('/api/login', [
-            'username' => 'QUINTO.INTENTO',
+            'username' => 'TERCER.INTENTO',
             'password' => 'Password123',
         ]);
 
-        foreach ([$fifthAttemptResponse, $blockedResponse] as $response) {
+        foreach ([$thirdAttemptResponse, $blockedResponse] as $response) {
             $response->assertUnauthorized();
             $this->assertSame($referenceResponse->status(), $response->status());
             $this->assertSame($referenceResponse->json(), $response->json());
         }
 
         $user->refresh();
-        $this->assertSame(5, $user->intentos_fallidos);
+        $this->assertSame(3, $user->intentos_fallidos);
         $this->assertTrue($user->bloqueado_hasta->isFuture());
-        $this->assertDatabaseCount('bitacoras', 2);
+        $this->assertSame(now()->addMinutes(5)->timestamp, $user->bloqueado_hasta->timestamp);
+        $this->assertDatabaseCount('bitacoras', 4);
         $this->assertDatabaseHas('bitacoras', [
             'id_usuario' => $user->id_usuario,
             'descripcion_movimiento' => 'Cuenta bloqueada por intentos fallidos.',
@@ -1029,7 +1043,7 @@ class UserManagementTest extends TestCase
         ]);
     }
 
-    public function test_five_failures_across_usernames_block_only_the_same_browser_before_user_lookup(): void
+    public function test_three_failures_across_usernames_block_only_the_same_browser_before_user_lookup(): void
     {
         $this->withCredentials();
         $firstUser = User::factory()->create([
@@ -1047,7 +1061,7 @@ class UserManagementTest extends TestCase
 
         $browserCookie = null;
 
-        foreach (['NO.EXISTE', 'PRIMER.USUARIO', 'OTRO.INEXISTENTE', 'SEGUNDO.USUARIO'] as $username) {
+        foreach (['PRIMER.USUARIO', 'SEGUNDO.USUARIO'] as $username) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
                 ->postJson('/api/login', [
                     'username' => $username,
@@ -1104,7 +1118,7 @@ class UserManagementTest extends TestCase
             'nombre_usuario' => 'CUENTA.COMPARTIDA',
         ]);
 
-        foreach (['192.0.2.20', '192.0.2.21', '192.0.2.20', '192.0.2.21', '192.0.2.22'] as $ip) {
+        foreach (['192.0.2.20', '192.0.2.21', '192.0.2.22'] as $ip) {
             $this->withServerVariables(['REMOTE_ADDR' => $ip])
                 ->postJson('/api/login', [
                     'username' => 'CUENTA.COMPARTIDA',
@@ -1114,9 +1128,9 @@ class UserManagementTest extends TestCase
         }
 
         $user->refresh();
-        $this->assertSame(5, $user->intentos_fallidos);
+        $this->assertSame(3, $user->intentos_fallidos);
         $this->assertTrue($user->bloqueado_hasta->isFuture());
-        $this->assertDatabaseCount('bitacoras', 5);
+        $this->assertDatabaseCount('bitacoras', 3);
 
         $this->withServerVariables(['REMOTE_ADDR' => '192.0.2.23'])
             ->postJson('/api/login', [
@@ -1128,11 +1142,11 @@ class UserManagementTest extends TestCase
                 'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
             ]);
 
-        $this->assertSame(5, $user->fresh()->intentos_fallidos);
-        $this->assertDatabaseCount('bitacoras', 6);
+        $this->assertSame(3, $user->fresh()->intentos_fallidos);
+        $this->assertDatabaseCount('bitacoras', 4);
     }
 
-    public function test_browser_limit_expires_five_minutes_after_fifth_failure_and_valid_login_succeeds(): void
+    public function test_browser_limit_expires_five_minutes_after_third_failure_and_valid_login_succeeds(): void
     {
         $this->withCredentials();
         $this->freezeTime();
@@ -1149,7 +1163,7 @@ class UserManagementTest extends TestCase
 
         $browserCookie = null;
 
-        for ($attempt = 1; $attempt <= 4; $attempt++) {
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')->postJson('/api/login', [
                 'username' => 'NO.EXISTE',
                 'password' => 'Password123',
@@ -1158,12 +1172,12 @@ class UserManagementTest extends TestCase
             $this->travel(6)->minutes();
         }
 
-        $fifthResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
+        $thirdResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
             'username' => 'NO.EXISTE',
             'password' => 'Password123',
         ]);
-        $this->assertLoginRateLimited($fifthResponse);
-        $fifthResponse->assertJsonPath('retry_after', 300);
+        $this->assertLoginRateLimited($thirdResponse);
+        $thirdResponse->assertJsonPath('retry_after', 300);
 
         $this->travel(4)->minutes();
         $blockedResponse = $this->withCookie('pizzerp_login_browser', $browserCookie)->postJson('/api/login', [
@@ -1201,7 +1215,7 @@ class UserManagementTest extends TestCase
         ]);
 
         $browserCookie = null;
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
                 ->withServerVariables(['REMOTE_ADDR' => '192.0.2.40'])
                 ->postJson('/api/login', [
@@ -1209,7 +1223,7 @@ class UserManagementTest extends TestCase
                     'password' => 'Password123',
                 ]);
 
-            $attempt < 5
+            $attempt < 3
                 ? $response->assertUnauthorized()
                 : $this->assertLoginRateLimited($response);
             $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
@@ -1248,7 +1262,7 @@ class UserManagementTest extends TestCase
         ]);
 
         $browserCookie = null;
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie ?? '')
                 ->withServerVariables(['REMOTE_ADDR' => "192.0.2.{$attempt}"])
                 ->postJson('/api/login', [
@@ -1256,7 +1270,7 @@ class UserManagementTest extends TestCase
                     'password' => 'Password123',
                 ]);
 
-            $attempt < 5
+            $attempt < 3
                 ? $response->assertUnauthorized()
                 : $this->assertLoginRateLimited($response);
             $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
@@ -1289,7 +1303,7 @@ class UserManagementTest extends TestCase
         $user = User::factory()->create();
         $browserCookie = '';
 
-        for ($attempt = 1; $attempt <= 3; $attempt++) {
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
@@ -1304,7 +1318,7 @@ class UserManagementTest extends TestCase
                 'password' => 'Password123',
             ])->assertOk();
 
-        for ($attempt = 1; $attempt <= 4; $attempt++) {
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
             $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
@@ -1325,7 +1339,7 @@ class UserManagementTest extends TestCase
         $this->withCredentials();
         $user = User::factory()->create();
 
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
             $this->withCookie('pizzerp_login_browser', '')
                 ->postJson('/api/login', [
                     'username' => $user->nombre_usuario,
@@ -1333,7 +1347,7 @@ class UserManagementTest extends TestCase
                 ])->assertUnauthorized();
         }
 
-        $this->assertSame(5, $user->fresh()->intentos_fallidos);
+        $this->assertSame(3, $user->fresh()->intentos_fallidos);
         $this->assertTrue($user->fresh()->bloqueado_hasta->isFuture());
         $this->withCookie('pizzerp_login_browser', '')
             ->postJson('/api/login', [
@@ -1352,7 +1366,7 @@ class UserManagementTest extends TestCase
         $user = User::factory()->create();
         $browserCookie = '';
 
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', [
                     'username' => 'NO.EXISTE',
@@ -1375,7 +1389,11 @@ class UserManagementTest extends TestCase
             ]));
     }
 
-    public function test_missing_wrong_inactive_and_blocked_logins_all_count_on_one_browser(): void
+    #[TestWith(['missing'])]
+    #[TestWith(['wrong'])]
+    #[TestWith(['inactive'])]
+    #[TestWith(['blocked'])]
+    public function test_each_failed_login_reason_can_trigger_third_browser_failure(string $reason): void
     {
         $this->withCredentials();
         config()->set('sanctum.stateful', ['localhost']);
@@ -1387,18 +1405,18 @@ class UserManagementTest extends TestCase
             'bloqueado_hasta' => now()->addMinutes(5),
         ]);
         $browserCookie = '';
-        $attempts = [
-            ['NO.EXISTE', 'Password123'],
-            [$wrongPasswordUser->nombre_usuario, 'WrongPassword456'],
-            [$inactiveUser->nombre_usuario, 'Password123'],
-            [$blockedUser->nombre_usuario, 'Password123'],
-            ['OTRO.INEXISTENTE', 'Password123'],
-        ];
+        $thirdAttempt = match ($reason) {
+            'missing' => ['OTRO.INEXISTENTE', 'Password123'],
+            'wrong' => [$wrongPasswordUser->nombre_usuario, 'WrongPassword456'],
+            'inactive' => [$inactiveUser->nombre_usuario, 'Password123'],
+            'blocked' => [$blockedUser->nombre_usuario, 'Password123'],
+        };
+        $attempts = [['NO.EXISTE', 'Password123'], ['NO.EXISTE', 'Password123'], $thirdAttempt];
 
         foreach ($attempts as $index => [$username, $password]) {
             $response = $this->withCookie('pizzerp_login_browser', $browserCookie)
                 ->postJson('/api/login', compact('username', 'password'));
-            $index === 4
+            $index >= 2
                 ? $this->assertLoginRateLimited($response)
                 : $response->assertUnauthorized()->assertExactJson([
                     'message' => "No fue posible iniciar sesión.\nVerifica tus credenciales.",
@@ -1406,7 +1424,7 @@ class UserManagementTest extends TestCase
             $browserCookie = $response->getCookie('pizzerp_login_browser')->getValue();
         }
 
-        $this->assertSame(1, $wrongPasswordUser->fresh()->intentos_fallidos);
+        $this->assertSame($reason === 'wrong' ? 1 : 0, $wrongPasswordUser->fresh()->intentos_fallidos);
         $this->assertSame(0, $inactiveUser->fresh()->intentos_fallidos);
         $this->assertSame(5, $blockedUser->fresh()->intentos_fallidos);
     }
@@ -1562,7 +1580,7 @@ class UserManagementTest extends TestCase
             ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.EDITABLE')
             ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
 
-        $this->assertCount(4, $queries);
+        $this->assertCount(6, $queries);
         $this->assertCount(0, array_filter(
             $queries,
             fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
@@ -1604,7 +1622,7 @@ class UserManagementTest extends TestCase
             ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.NUEVO')
             ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
 
-        $this->assertCount(5, $queries);
+        $this->assertCount(7, $queries);
         $this->assertCount(1, array_filter(
             $queries,
             fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
@@ -1636,7 +1654,7 @@ class UserManagementTest extends TestCase
         ])
             ->assertUnprocessable()
             ->assertJsonValidationErrors('nombre_usuario')
-            ->assertJsonPath('errors.nombre_usuario.0', 'El nombre de usuario ya está registrado.');
+            ->assertJsonPath('errors.nombre_usuario.0', 'Usuario existente.');
 
         $this->assertSame('USUARIO.EDITABLE', $user->fresh()->nombre_usuario);
         $this->assertDatabaseCount('bitacoras', 0);
@@ -1679,7 +1697,7 @@ class UserManagementTest extends TestCase
         $this->assertDatabaseCount('bitacoras', 0);
     }
 
-    public function test_update_rejects_invalid_role_without_locking_administrators(): void
+    public function test_update_rejects_unknown_dynamic_role_without_writing_or_validating_unchanged_username(): void
     {
         $administrator = User::factory()->administrator()->create();
         $user = User::factory()->create([
@@ -1707,10 +1725,11 @@ class UserManagementTest extends TestCase
             ->assertUnprocessable()
             ->assertJsonPath('errors.rol.0', 'El rol seleccionado no es válido.');
 
-        $this->assertCount(1, array_filter(
+        $this->assertCount(4, array_filter(
             $queries,
             fn (array $query): bool => str_starts_with(strtolower($query['query']), 'select ')
         ));
+        $this->assertCount(0, array_filter($queries, fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')));
         $this->assertSame('CAJA', $user->fresh()->rol);
         $this->assertDatabaseCount('bitacoras', 0);
     }
@@ -1987,8 +2006,9 @@ class UserManagementTest extends TestCase
         $this->assertDatabaseCount('bitacoras', 0);
     }
 
-    public function test_last_active_administrator_cannot_be_deactivated(): void
+    public function test_administrator_can_be_deactivated_when_another_permission_manager_remains(): void
     {
+        Rol::where('nombre', 'TI')->update(['permisos' => Rol::systemPermissions('ADMINISTRADOR')]);
         $actor = User::factory()->create(['rol' => 'TI']);
         $lastActiveAdministrator = User::factory()
             ->administrator()
@@ -2000,26 +2020,24 @@ class UserManagementTest extends TestCase
             "/api/users/{$lastActiveAdministrator->id_usuario}/estado",
             ['estado' => 'INACTIVO']
         )
-            ->assertUnprocessable()
-            ->assertJsonValidationErrors('estado');
+            ->assertOk();
 
         $this->assertSame(
-            'ACTIVO',
+            'INACTIVO',
             $lastActiveAdministrator->fresh()->estado
         );
-        $this->assertDatabaseCount('bitacoras', 0);
+        $this->assertDatabaseCount('bitacoras', 1);
     }
 
-    public function test_last_active_administrator_cannot_change_role(): void
+    public function test_last_permission_manager_cannot_change_its_own_role(): void
     {
-        $actor = User::factory()->create(['rol' => 'TI']);
         $lastActiveAdministrator = User::factory()
             ->administrator()
             ->create([
                 'nombre_usuario' => 'ULTIMO.ADMINISTRADOR',
             ]);
 
-        Sanctum::actingAs($actor);
+        Sanctum::actingAs($lastActiveAdministrator);
 
         $this->patchJson(
             "/api/users/{$lastActiveAdministrator->id_usuario}",

@@ -63,13 +63,7 @@ class CategoriaController extends Controller
 
     private function authorizeAdministrator(Request $request): User
     {
-        $user = $request->user();
-
-        if (! $user instanceof User || mb_strtoupper(trim((string) $user->rol)) !== 'ADMINISTRADOR') {
-            abort(403, 'No tiene permiso para gestionar categorías.');
-        }
-
-        return $user;
+        return $this->authorizeModule($request, 'categorias');
     }
 
     private function normalizeInput(Request $request): void

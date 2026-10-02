@@ -6,13 +6,19 @@ use App\Models\Bitacora;
 use App\Models\Categoria;
 use App\Models\Producto;
 use App\Models\User;
-use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Laravel\Sanctum\Sanctum;
+use Tests\Support\BuildsManagementSchema;
 use Tests\TestCase;
 
 class CatalogManagementTest extends TestCase
 {
-    use LazilyRefreshDatabase;
+    use BuildsManagementSchema;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->buildManagementSchema();
+    }
 
     public function test_administrator_creates_category_and_product_with_their_relation(): void
     {

@@ -18,13 +18,13 @@ use Illuminate\Support\Facades\Hash;
 
 class AuthController extends Controller
 {
-    private const MAX_FAILED_ATTEMPTS = 5;
+    private const MAX_FAILED_ATTEMPTS = 3;
 
     private const LOCK_MINUTES = 5;
 
     private const BROWSER_COOKIE = 'pizzerp_login_browser';
 
-    private const MAX_BROWSER_FAILED_ATTEMPTS = 5;
+    private const MAX_BROWSER_FAILED_ATTEMPTS = 3;
 
     private const BROWSER_LOCK_SECONDS = 300;
 
@@ -226,7 +226,7 @@ class AuthController extends Controller
                     $lockedUser,
                     'Cuenta bloqueada por intentos fallidos.',
                     'AUTENTICACION',
-                    'Se alcanzó el máximo de 5 intentos fallidos.'
+                    'Se alcanzó el máximo de 3 intentos fallidos.'
                 );
 
                 return;
@@ -247,7 +247,7 @@ class AuthController extends Controller
     /*
      * Respuesta genérica de credenciales inválidas.
      * Los fallos se acumulan para el navegador hasta un login correcto
-     * o el vencimiento del bloqueo iniciado por el quinto fallo.
+     * o el vencimiento del bloqueo iniciado por el tercer fallo.
      */
     private function failedLoginResponse(?string $browserKey = null): JsonResponse
     {

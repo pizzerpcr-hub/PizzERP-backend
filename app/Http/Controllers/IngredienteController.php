@@ -146,16 +146,7 @@ class IngredienteController extends Controller
 
     private function authorizedManager(Request $request): User
     {
-        $user = $request->user();
-
-        if (
-            ! $user instanceof User
-            || ! in_array(mb_strtoupper(trim((string) $user->rol)), ['ADMINISTRADOR', 'TI'], true)
-        ) {
-            abort(403, 'No tiene permiso para gestionar ingredientes.');
-        }
-
-        return $user;
+        return $this->authorizeModule($request, 'ingredientes');
     }
 
     private function normalizeInput(Request $request): void

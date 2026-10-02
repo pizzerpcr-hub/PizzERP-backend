@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Bitacora;
+use App\Models\Categoria;
 use App\Models\Producto;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -12,6 +13,18 @@ use Illuminate\Validation\Rule;
 
 class ProductoController extends Controller
 {
+    public function selectableCategories(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (! $user instanceof User || (! $user->hasModulePermission('productos', 'crear')
+            && ! $user->hasModulePermission('productos', 'editar'))) {
+            abort(403, 'No tiene permiso para seleccionar categorías.');
+        }
+
+        return response()->json(['categorias' => Categoria::query()->where('estado', 'ACTIVO')
+            ->orderBy('nombre')->get(['id_categoria', 'nombre'])]);
+    }
+
     public function index(Request $request): JsonResponse
     {
         $this->authorizeAdministrator($request);
@@ -62,13 +75,7 @@ class ProductoController extends Controller
 
     private function authorizeAdministrator(Request $request): User
     {
-        $user = $request->user();
-
-        if (! $user instanceof User || mb_strtoupper(trim((string) $user->rol)) !== 'ADMINISTRADOR') {
-            abort(403, 'No tiene permiso para gestionar productos.');
-        }
-
-        return $user;
+        return $this->authorizeModule($request, 'productos');
     }
 
     private function normalizeInput(Request $request): void
