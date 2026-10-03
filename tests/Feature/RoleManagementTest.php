@@ -504,7 +504,7 @@ class RoleManagementTest extends TestCase
         }
 
         $response->assertOk()->assertJsonPath('rol.estado', $next)->assertJsonPath('rol.usuarios_count', 0);
-        $this->assertCount(6, $queries);
+        $this->assertCount(8, $queries);
         $this->assertCount(1, array_filter($queries, fn (array $query): bool => str_starts_with(strtolower($query['query']), 'select * from "roles" order by')
         ));
         $this->assertCount(0, array_filter($queries, fn (array $query): bool => str_starts_with(strtolower($query['query']), 'select * from "roles" where "roles"."id_rol"')));

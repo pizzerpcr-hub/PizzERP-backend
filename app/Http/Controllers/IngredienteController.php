@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Models\Bitacora;
 use App\Models\Ingrediente;
 use App\Models\User;
@@ -55,6 +56,7 @@ class IngredienteController extends Controller
                 "Ingrediente {$ingrediente->nombre} (ID {$ingrediente->id_ingrediente}) creado.",
                 "Cantidad inicial: {$ingrediente->cantidad_disponible} {$ingrediente->unidad_medida}; estado: {$ingrediente->estado}."
             );
+            ModuleDataChanged::dispatch('ingredientes', 'created');
 
             return $ingrediente;
         });
@@ -115,6 +117,7 @@ class IngredienteController extends Controller
                 mb_strimwidth($reason, 0, 255),
                 $auditType
             );
+            ModuleDataChanged::dispatch('ingredientes', in_array('estado', $changedFields, true) ? 'status' : 'updated');
 
             return $lockedIngredient;
         });
@@ -148,6 +151,7 @@ class IngredienteController extends Controller
                     "Ingrediente {$lockedIngredient->nombre} (ID {$lockedIngredient->id_ingrediente}) cambió de estado.",
                     "Estado: {$previousStatus} -> {$lockedIngredient->estado}."
                 );
+                ModuleDataChanged::dispatch('ingredientes', 'status');
             }
 
             return $lockedIngredient;
@@ -176,6 +180,7 @@ class IngredienteController extends Controller
             );
 
             $lockedIngredient->delete();
+            ModuleDataChanged::dispatch('ingredientes', 'deleted');
         });
 
         return response()->noContent();

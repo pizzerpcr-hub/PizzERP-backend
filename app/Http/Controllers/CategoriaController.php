@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Models\Bitacora;
 use App\Models\Categoria;
 use App\Models\User;
@@ -39,6 +40,7 @@ class CategoriaController extends Controller
                 'estado' => $data['estado'] ?? 'ACTIVO',
             ]);
             $this->recordAudit($manager, "Categoría {$categoria->nombre} (ID {$categoria->id_categoria}) creada.");
+            ModuleDataChanged::dispatch('categorias', 'created');
 
             return $categoria;
         });
@@ -57,8 +59,10 @@ class CategoriaController extends Controller
             $categoria->fill($data);
 
             if ($categoria->isDirty()) {
+                $statusChanged = $categoria->isDirty('estado');
                 $categoria->save();
                 $this->recordAudit($manager, "Categoría {$categoria->nombre} (ID {$categoria->id_categoria}) actualizada.");
+                ModuleDataChanged::dispatch('categorias', $statusChanged ? 'status' : 'updated');
             }
         });
         $categoria->loadCount('productos');

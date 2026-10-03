@@ -1,6 +1,8 @@
 // Diagnostic client: deliberately never unsubscribes or reconnects.
 import { createInterface } from 'node:readline';
-const socket = new WebSocket('ws://127.0.0.1:18080/app/test-key?protocol=7&client=js&version=8.4.0');
+const socket = new WebSocket('ws://127.0.0.1:18080/app/test-key?protocol=7&client=js&version=8.4.0', {
+    headers: { Origin: 'http://localhost' },
+});
 socket.addEventListener('message', ({data}) => {
     const message = JSON.parse(data);
     if (message.event === 'pusher:ping') {

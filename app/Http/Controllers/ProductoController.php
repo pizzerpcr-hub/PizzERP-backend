@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Models\Bitacora;
 use App\Models\Categoria;
 use App\Models\Ingrediente;
@@ -71,6 +72,7 @@ class ProductoController extends Controller
                 $producto->ingredientes()->sync($this->ingredientQuantities($data['ingredientes']));
             }
             $this->recordAudit($manager, "Producto {$producto->codigo_producto} (ID {$producto->id_producto}) creado.");
+            ModuleDataChanged::dispatch('productos', 'created');
 
             return $producto;
         });
@@ -99,8 +101,10 @@ class ProductoController extends Controller
             }
 
             if ($producto->isDirty() || $ingredientsChanged) {
+                $statusChanged = $producto->isDirty('estado');
                 $producto->save();
                 $this->recordAudit($manager, "Producto {$producto->codigo_producto} (ID {$producto->id_producto}) actualizado.");
+                ModuleDataChanged::dispatch('productos', $statusChanged ? 'status' : 'updated');
             }
         });
         $producto->load(['categoria:id_categoria,nombre', 'ingredientes:id_ingrediente,nombre,unidad_medida,estado']);
@@ -123,6 +127,7 @@ class ProductoController extends Controller
                 $lockedProduct->estado = $data['estado'];
                 $lockedProduct->save();
                 $this->recordAudit($manager, "Producto {$lockedProduct->codigo_producto} (ID {$lockedProduct->id_producto}) cambió de estado a {$lockedProduct->estado}.");
+                ModuleDataChanged::dispatch('productos', 'status');
             }
         });
         $producto->refresh()->load(['categoria:id_categoria,nombre', 'ingredientes:id_ingrediente,nombre,unidad_medida,estado']);

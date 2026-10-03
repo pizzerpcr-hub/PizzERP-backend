@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Events\UserAccessChanged;
 use App\Events\UserStatus;
 use App\Models\Bitacora;
@@ -111,6 +112,7 @@ class UserController extends Controller
                 "Usuario {$user->nombre_usuario} (ID {$user->id_usuario}) creado.",
                 'Se creó una cuenta de usuario.'
             );
+            ModuleDataChanged::dispatch('usuarios', 'created');
 
             return $user;
         });
@@ -232,6 +234,7 @@ class UserController extends Controller
                     "Usuario {$lockedUser->nombre_usuario} (ID {$lockedUser->id_usuario}) actualizado.",
                     'Campos modificados: '.implode(', ', $modifiedFields).'.'
                 );
+                ModuleDataChanged::dispatch('usuarios', 'updated');
                 if (in_array('rol', $modifiedFields, true)) {
                     $assignedRole = $roles->firstWhere('nombre', $lockedUser->rol);
                     UserAccessChanged::dispatch(
@@ -330,6 +333,7 @@ class UserController extends Controller
                     "Estado anterior: {$previousStatus}; estado nuevo: {$lockedUser->estado}."
                 );
                 UserStatus::dispatch($this->userPayload($lockedUser));
+                ModuleDataChanged::dispatch('usuarios', 'status');
             }
 
             return $lockedUser;

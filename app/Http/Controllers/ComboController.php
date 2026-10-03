@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Models\Bitacora;
 use App\Models\Combo;
 use App\Models\Producto;
@@ -61,6 +62,7 @@ class ComboController extends Controller
             $combo = Combo::create(collect($data)->except('productos')->all() + ['estado' => 'ACTIVO']);
             $this->syncProducts($combo, $data['productos']);
             $this->audit($actor, $combo, 'creado');
+            ModuleDataChanged::dispatch('combos', 'created');
 
             return $combo;
         });
@@ -89,6 +91,7 @@ class ComboController extends Controller
             }
             if ($changed) {
                 $this->audit($actor, $locked, 'actualizado');
+                ModuleDataChanged::dispatch('combos', 'updated');
             }
 
             return $locked;
@@ -111,6 +114,7 @@ class ComboController extends Controller
                 $locked->estado = $data['estado'];
                 $locked->save();
                 $this->audit($actor, $locked, 'estado actualizado a '.$locked->estado);
+                ModuleDataChanged::dispatch('combos', 'status');
             }
 
             return $locked;

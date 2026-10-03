@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Events\ModuleDataChanged;
 use App\Events\UserChanged;
 use App\Events\UserCreated;
 use App\Events\UserStatus;
@@ -40,13 +41,13 @@ class UserManagementTest extends TestCase
         if (getenv('RUN_REVERB_DIAGNOSTIC') !== '1') {
             $this->markTestSkipped('Opt-in diagnostic requires isolated Reverb on 127.0.0.1:18080 with test credentials.');
         }
-        $this->configureBroadcastAuth();
         config(['sanctum.stateful' => ['localhost']]);
         config([
             'broadcasting.connections.reverb.options' => [
                 'host' => '127.0.0.1', 'port' => 18080, 'scheme' => 'http', 'useTLS' => false,
             ],
         ]);
+        $this->configureBroadcastAuth();
         $pusher = new Pusher('test-key', 'test-secret', 'test-app', [
             'host' => '127.0.0.1', 'port' => 18080, 'scheme' => 'http', 'useTLS' => false,
         ]);
@@ -564,11 +565,8 @@ class UserManagementTest extends TestCase
             ['id_usuario', 'nombre_completo', 'nombre_usuario', 'rol', 'estado'],
             array_keys($response->json('usuario'))
         );
-        if ($action === 'status') {
-            Queue::assertPushed(BroadcastEvent::class, 1);
-        } else {
-            Queue::assertNothingPushed();
-        }
+        Queue::assertPushed(BroadcastEvent::class, fn (BroadcastEvent $job): bool => $job->event instanceof ModuleDataChanged);
+        Queue::assertPushed(BroadcastEvent::class, $action === 'status' ? 2 : 1);
     }
 
     public function test_ti_session_can_be_restored_and_list_users(): void
@@ -718,7 +716,7 @@ class UserManagementTest extends TestCase
     #[TestWith(['create', UserCreated::class])]
     #[TestWith(['update', UserChanged::class])]
     #[TestWith(['status', UserStatus::class])]
-    public function test_user_mutation_queues_only_status_event_after_outer_commit(
+    public function test_user_mutation_queues_crud_notice_and_existing_status_event_after_outer_commit(
         string $action,
         string $eventClass
     ): void {
@@ -736,11 +734,8 @@ class UserManagementTest extends TestCase
             $action === 'status' ? ['private-usuario.'.$user->id_usuario] : [],
             array_map(fn ($channel) => $channel->name, (new $eventClass($response->json('usuario')))->broadcastOn())
         );
-        if ($action === 'status') {
-            Queue::assertPushed(BroadcastEvent::class, 1);
-        } else {
-            Queue::assertNothingPushed();
-        }
+        Queue::assertPushed(BroadcastEvent::class, fn (BroadcastEvent $job): bool => $job->event instanceof ModuleDataChanged);
+        Queue::assertPushed(BroadcastEvent::class, $action === 'status' ? 2 : 1);
         $this->assertDatabaseCount('bitacoras', 1);
     }
 
@@ -787,7 +782,7 @@ class UserManagementTest extends TestCase
             'nombre_completo' => 'Nombre confirmado',
         ]);
         $this->assertDatabaseCount('bitacoras', 1);
-        Exceptions::assertNothingReported();
+        Exceptions::assertReported(RuntimeException::class);
     }
 
     private function performBroadcastMutation(string $action, User $user): TestResponse
@@ -1580,7 +1575,7 @@ class UserManagementTest extends TestCase
             ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.EDITABLE')
             ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
 
-        $this->assertCount(6, $queries);
+        $this->assertCount(8, $queries);
         $this->assertCount(0, array_filter(
             $queries,
             fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')
@@ -1622,7 +1617,7 @@ class UserManagementTest extends TestCase
             ->assertJsonPath('usuario.nombre_usuario', 'USUARIO.NUEVO')
             ->assertJsonPath('usuario.nombre_completo', 'Nombre actualizado');
 
-        $this->assertCount(7, $queries);
+        $this->assertCount(9, $queries);
         $this->assertCount(1, array_filter(
             $queries,
             fn (array $query): bool => str_contains(strtolower($query['query']), 'count(')

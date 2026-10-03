@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ModuleDataChanged;
 use App\Events\RoleAccessChanged;
 use App\Models\Bitacora;
 use App\Models\Rol;
@@ -49,6 +50,7 @@ class RolController extends Controller
             $this->authorizeDelegation($actor, $data['permisos']);
             $role = Rol::create([...$data, 'estado' => $data['estado'] ?? 'ACTIVO']);
             $this->audit($actor, $role, 'creado');
+            ModuleDataChanged::dispatch('roles', 'created');
 
             return $role;
         });
@@ -83,6 +85,7 @@ class RolController extends Controller
                     ManagementAccess::assertManagerRemains($roles, 'permisos');
                 }
                 $this->audit($actor, $locked, 'actualizado');
+                ModuleDataChanged::dispatch('roles', 'updated');
                 RoleAccessChanged::dispatch(
                     (int) $locked->getKey(),
                     $locked->nombre,
@@ -114,6 +117,7 @@ class RolController extends Controller
                     ManagementAccess::assertManagerRemains($roles, 'estado');
                 }
                 $this->audit($actor, $locked, 'estado actualizado a '.$locked->estado);
+                ModuleDataChanged::dispatch('roles', 'status');
                 RoleAccessChanged::dispatch(
                     (int) $locked->getKey(),
                     $locked->nombre,
