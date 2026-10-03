@@ -17,9 +17,14 @@ class CategoriaController extends Controller
     {
         $this->authorizeAdministrator($request);
 
-        return response()->json([
-            'categorias' => Categoria::query()->withCount('productos')->orderBy('nombre')->get(),
-        ]);
+        return $this->listResponse($request,
+            Categoria::query()->select(['id_categoria', 'nombre', 'descripcion', 'estado'])
+                ->withCount('productos')->orderBy('nombre')->orderBy('id_categoria'),
+            'categorias',
+            search: fn ($query, string $term) => $query->where(fn ($query) => $query
+                ->whereLike('nombre', "%{$term}%")
+                ->orWhereLike('descripcion', "%{$term}%"))
+        );
     }
 
     public function store(Request $request): JsonResponse

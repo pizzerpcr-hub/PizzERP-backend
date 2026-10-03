@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\RoleAccessChanged;
 use App\Models\Bitacora;
 use App\Models\Rol;
 use App\Models\User;
@@ -17,7 +18,12 @@ class RolController extends Controller
     {
         $this->authorizeModule($request, 'roles');
 
-        return response()->json(['roles' => Rol::query()->withCount('usuarios')->orderBy('nombre')->get()]);
+        return $this->listResponse($request,
+            Rol::query()->select(['id_rol', 'nombre', 'permisos', 'estado', 'es_sistema'])
+                ->withCount('usuarios')->orderBy('nombre')->orderBy('id_rol'),
+            'roles',
+            search: fn ($query, string $term) => $query->whereLike('nombre', "%{$term}%")
+        );
     }
 
     public function show(Request $request, string $role): JsonResponse
@@ -77,6 +83,12 @@ class RolController extends Controller
                     ManagementAccess::assertManagerRemains($roles, 'permisos');
                 }
                 $this->audit($actor, $locked, 'actualizado');
+                RoleAccessChanged::dispatch(
+                    (int) $locked->getKey(),
+                    $locked->nombre,
+                    $locked->estado === 'ACTIVO' ? $locked->permisos : Rol::emptyPermissions(),
+                    (int) round(microtime(true) * 1_000_000)
+                );
             }
 
             return $locked;
@@ -102,6 +114,12 @@ class RolController extends Controller
                     ManagementAccess::assertManagerRemains($roles, 'estado');
                 }
                 $this->audit($actor, $locked, 'estado actualizado a '.$locked->estado);
+                RoleAccessChanged::dispatch(
+                    (int) $locked->getKey(),
+                    $locked->nombre,
+                    $locked->estado === 'ACTIVO' ? $locked->permisos : Rol::emptyPermissions(),
+                    (int) round(microtime(true) * 1_000_000)
+                );
             }
 
             return $locked;

@@ -5,6 +5,7 @@ namespace App\Models;
 use Database\Factories\IngredienteFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 
 class Ingrediente extends Model
 {
@@ -29,5 +30,11 @@ class Ingrediente extends Model
         return [
             'cantidad_disponible' => 'decimal:2',
         ];
+    }
+
+    public function productos(): BelongsToMany
+    {
+        return $this->belongsToMany(Producto::class, 'producto_ingredientes', 'id_ingrediente', 'id_producto')
+            ->withPivot('id_producto_ingrediente', 'cantidad_requerida', 'unidad_medida');
     }
 }

@@ -229,6 +229,45 @@ class IngredientManagementTest extends TestCase
         $this->assertStringContainsString('4.50 kg', Bitacora::sole()->motivo);
     }
 
+    public function test_ingredient_status_can_be_changed_without_deleting_it(): void
+    {
+        Sanctum::actingAs(User::factory()->administrator()->create());
+        $ingredient = Ingrediente::factory()->create(['estado' => 'ACTIVO']);
+
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", [
+            'estado' => 'inactivo',
+        ])->assertOk()->assertJsonPath('ingrediente.estado', 'INACTIVO');
+
+        $this->assertDatabaseHas('ingredientes', [
+            'id_ingrediente' => $ingredient->id_ingrediente,
+            'estado' => 'INACTIVO',
+        ]);
+        $this->assertDatabaseCount('bitacoras', 1);
+
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", [
+            'estado' => 'INACTIVO',
+        ])->assertOk();
+        $this->assertDatabaseCount('bitacoras', 1);
+
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", [
+            'estado' => 'ACTIVO',
+        ])->assertOk()->assertJsonPath('ingrediente.estado', 'ACTIVO');
+        $this->assertDatabaseCount('bitacoras', 2);
+    }
+
+    public function test_ingredient_status_rejects_invalid_value(): void
+    {
+        Sanctum::actingAs(User::factory()->administrator()->create());
+        $ingredient = Ingrediente::factory()->create(['estado' => 'ACTIVO']);
+
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", [
+            'estado' => 'BORRADO',
+        ])->assertUnprocessable()->assertJsonValidationErrors('estado');
+
+        $this->assertSame('ACTIVO', $ingredient->fresh()->estado);
+        $this->assertDatabaseCount('bitacoras', 0);
+    }
+
     public function test_unauthenticated_user_cannot_list_ingredients(): void
     {
         $this->getJson('/api/ingredients')->assertUnauthorized();

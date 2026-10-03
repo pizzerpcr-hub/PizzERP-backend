@@ -32,7 +32,16 @@ class ComboController extends Controller
     {
         $this->authorizeModule($request, 'combos');
 
-        return response()->json(['combos' => Combo::query()->with('productos')->orderBy('nombre')->get()->map(fn (Combo $combo): array => $this->payload($combo))]);
+        return $this->listResponse($request,
+            Combo::query()->with('productos')->orderBy('nombre')->orderBy('id_combo'),
+            'combos',
+            fn (Combo $combo): array => $this->payload($combo),
+            fn ($query, string $term) => $query->where(fn ($query) => $query
+                ->whereLike('codigo_combo', "%{$term}%")
+                ->orWhereLike('nombre', "%{$term}%")
+                ->orWhereLike('estado', "%{$term}%")
+                ->orWhereHas('productos', fn ($query) => $query->whereLike('nombre', "%{$term}%")))
+        );
     }
 
     public function show(Request $request, string $combo): JsonResponse

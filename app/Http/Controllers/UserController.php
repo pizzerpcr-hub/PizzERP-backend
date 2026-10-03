@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\UserAccessChanged;
 use App\Events\UserStatus;
 use App\Models\Bitacora;
 use App\Models\Rol;
@@ -127,13 +128,16 @@ class UserController extends Controller
         $users = User::query()
             ->select(self::PUBLIC_COLUMNS)
             ->orderBy('nombre_completo')
-            ->get();
+            ->orderBy('id_usuario');
 
-        return response()->json([
-            'usuarios' => $users->map(
-                fn (User $user): array => $this->userPayload($user)
-            ),
-        ]);
+        return $this->listResponse($request, $users, 'usuarios',
+            fn (User $user): array => $this->userPayload($user),
+            fn ($query, string $term) => $query->where(fn ($query) => $query
+                ->whereLike('nombre_completo', "%{$term}%")
+                ->orWhereLike('nombre_usuario', "%{$term}%")
+                ->orWhereLike('rol', "%{$term}%")
+                ->orWhereLike('estado', "%{$term}%"))
+        );
     }
 
     public function update(Request $request): JsonResponse
@@ -228,6 +232,17 @@ class UserController extends Controller
                     "Usuario {$lockedUser->nombre_usuario} (ID {$lockedUser->id_usuario}) actualizado.",
                     'Campos modificados: '.implode(', ', $modifiedFields).'.'
                 );
+                if (in_array('rol', $modifiedFields, true)) {
+                    $assignedRole = $roles->firstWhere('nombre', $lockedUser->rol);
+                    UserAccessChanged::dispatch(
+                        (int) $lockedUser->getKey(),
+                        (int) $assignedRole->getKey(),
+                        $lockedUser->rol,
+                        $lockedUser->estado === 'ACTIVO' && $assignedRole->estado === 'ACTIVO'
+                            ? $assignedRole->permisos : Rol::emptyPermissions(),
+                        (int) round(microtime(true) * 1_000_000)
+                    );
+                }
             }
 
             return $lockedUser;

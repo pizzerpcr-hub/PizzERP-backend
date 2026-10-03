@@ -5,11 +5,44 @@ namespace App\Http\Controllers;
 use App\Models\Rol;
 use App\Models\User;
 use App\Services\ManagementAccess;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 abstract class Controller
 {
+    protected function listResponse(Request $request, Builder $query, string $key, ?callable $transform = null, ?callable $search = null): JsonResponse
+    {
+        if (! $request->has('page')) {
+            $items = $query->get();
+
+            return response()->json([$key => $transform ? $items->map($transform) : $items]);
+        }
+
+        $data = $request->validate([
+            'page' => ['required', 'integer', 'min:1'],
+            'search' => ['nullable', 'string', 'max:100'],
+        ]);
+        if ($search && filled($data['search'] ?? null)) {
+            $search($query, trim($data['search']));
+        }
+        $page = (int) $data['page'];
+        $paginator = $query->paginate(10, ['*'], 'page', $page);
+        $items = $paginator->getCollection();
+
+        return response()->json([
+            $key => $transform ? $items->map($transform) : $items,
+            'paginacion' => [
+                'pagina' => $paginator->currentPage(),
+                'totalPaginas' => $paginator->lastPage(),
+                'totalElementos' => $paginator->total(),
+                'inicio' => $paginator->firstItem() ?? 0,
+                'fin' => $paginator->lastItem() ?? 0,
+            ],
+        ]);
+    }
+
     protected function authorizeModule(Request $request, string $module, ?User $actor = null): User
     {
         $requestedStatus = $request->input('estado');

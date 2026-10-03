@@ -21,9 +21,12 @@ class IngredienteController extends Controller
     {
         $this->authorizedManager($request);
 
-        return response()->json([
-            'ingredientes' => Ingrediente::query()->orderBy('nombre')->get(),
-        ]);
+        return $this->listResponse($request,
+            Ingrediente::query()->select(['id_ingrediente', 'nombre', 'unidad_medida', 'cantidad_disponible', 'estado'])
+                ->orderBy('nombre')->orderBy('id_ingrediente'),
+            'ingredientes',
+            search: fn ($query, string $term) => $query->whereLike('nombre', "%{$term}%")
+        );
     }
 
     public function show(Request $request, Ingrediente $ingrediente): JsonResponse
@@ -118,6 +121,40 @@ class IngredienteController extends Controller
 
         return response()->json([
             'message' => 'Ingrediente actualizado exitosamente.',
+            'ingrediente' => $updatedIngredient,
+        ]);
+    }
+
+    public function updateStatus(Request $request, Ingrediente $ingrediente): JsonResponse
+    {
+        $this->normalizeInput($request);
+        $manager = $this->authorizedManager($request);
+        $data = $request->validate([
+            'estado' => ['required', Rule::in(self::ALLOWED_STATUSES)],
+        ], $this->validationMessages());
+
+        $updatedIngredient = DB::transaction(function () use ($ingrediente, $manager, $data): Ingrediente {
+            $lockedIngredient = Ingrediente::query()
+                ->whereKey($ingrediente->getKey())
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ($lockedIngredient->estado !== $data['estado']) {
+                $previousStatus = $lockedIngredient->estado;
+                $lockedIngredient->estado = $data['estado'];
+                $lockedIngredient->save();
+                $this->recordAudit(
+                    $manager,
+                    "Ingrediente {$lockedIngredient->nombre} (ID {$lockedIngredient->id_ingrediente}) cambió de estado.",
+                    "Estado: {$previousStatus} -> {$lockedIngredient->estado}."
+                );
+            }
+
+            return $lockedIngredient;
+        });
+
+        return response()->json([
+            'message' => 'Estado del ingrediente actualizado exitosamente.',
             'ingrediente' => $updatedIngredient,
         ]);
     }

@@ -35,6 +35,8 @@ trait BuildsManagementSchema
             '2026_10_01_221613_create_productos_table.php',
             '2026_10_02_012949_create_roles_table_and_link_usuarios.php',
             '2026_10_02_012950_create_combos_table.php',
+            '2026_10_02_213313_create_producto_ingredientes_table.php',
+            '2026_10_03_031333_add_unidad_medida_to_producto_ingredientes_table.php',
         ] as $filename) {
             (require database_path('migrations/'.$filename))->up();
         }

@@ -2,7 +2,10 @@
 
 namespace Tests\Feature;
 
+use App\Events\RoleAccessChanged;
+use App\Events\UserAccessChanged;
 use App\Models\Bitacora;
+use App\Models\Ingrediente;
 use App\Models\Producto;
 use App\Models\Rol;
 use App\Models\User;
@@ -95,6 +98,66 @@ class RoleManagementTest extends TestCase
         $this->assertSame($admin->id_usuario, Bitacora::sole()->id_usuario);
     }
 
+    public function test_role_and_user_changes_signal_active_sessions_to_refresh_access(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $cashier = User::factory()->create(['rol' => 'CAJA']);
+        $role = Rol::where('nombre', 'CAJA')->sole();
+        Event::fake([RoleAccessChanged::class, UserAccessChanged::class]);
+
+        Sanctum::actingAs($cashier);
+        $this->getJson('/api/permissions')->assertOk()->assertJsonPath('rol_id', $role->getKey());
+
+        Sanctum::actingAs($administrator);
+        $permissions = $role->permisos;
+        $permissions['productos']['ver'] = true;
+        $this->patchJson('/api/roles/'.$role->getKey(), ['permisos' => $permissions])->assertOk();
+        Event::assertDispatched(RoleAccessChanged::class, fn (RoleAccessChanged $event): bool => $event->broadcastWith() === [
+            'rol_id' => $role->getKey(),
+            'rol' => 'CAJA',
+            'permisos' => $permissions,
+            'revision' => $event->revision,
+        ] && $event->revision > 0);
+
+        $this->patchJson('/api/users/'.$cashier->getKey(), [
+            'nombre_completo' => $cashier->nombre_completo,
+            'nombre_usuario' => $cashier->nombre_usuario,
+            'rol' => 'COCINA',
+        ])->assertOk();
+        $kitchenRole = Rol::where('nombre', 'COCINA')->sole();
+        Event::assertDispatched(UserAccessChanged::class, fn (UserAccessChanged $event): bool => $event->broadcastWith() === [
+            'user_id' => $cashier->getKey(),
+            'rol_id' => $kitchenRole->getKey(),
+            'rol' => 'COCINA',
+            'permisos' => $kitchenRole->permisos,
+            'revision' => $event->revision,
+        ] && $event->revision > 0);
+    }
+
+    public function test_revoking_a_role_permission_broadcasts_the_full_access_state_and_blocks_the_api(): void
+    {
+        $administrator = User::factory()->administrator()->create();
+        $cashier = User::factory()->create(['rol' => 'CAJA']);
+        $role = Rol::where('nombre', 'CAJA')->sole();
+        $granted = $role->permisos;
+        $granted['productos']['ver'] = true;
+
+        Sanctum::actingAs($administrator);
+        $this->patchJson('/api/roles/'.$role->getKey(), ['permisos' => $granted])->assertOk();
+        Sanctum::actingAs($cashier);
+        $this->getJson('/api/products')->assertOk();
+
+        Event::fake([RoleAccessChanged::class]);
+        $revoked = $granted;
+        $revoked['productos']['ver'] = false;
+        Sanctum::actingAs($administrator);
+        $this->patchJson('/api/roles/'.$role->getKey(), ['permisos' => $revoked])->assertOk();
+        Event::assertDispatched(RoleAccessChanged::class, fn (RoleAccessChanged $event): bool => $event->broadcastWith()['permisos'] === $revoked);
+
+        Sanctum::actingAs($cashier);
+        $this->getJson('/api/products')->assertForbidden();
+    }
+
     public function test_admin_cannot_remove_essential_permissions_or_deactivate_admin_role(): void
     {
         Sanctum::actingAs(User::factory()->administrator()->create());
@@ -131,10 +194,17 @@ class RoleManagementTest extends TestCase
         $this->getJson('/api/users/roles')->assertOk()->assertJsonCount(4, 'roles');
         $this->getJson('/api/combos/productos')->assertOk()->assertJsonCount(0, 'productos');
         $this->getJson('/api/products/categorias')->assertOk()->assertJsonCount(0, 'categorias');
+        $this->getJson('/api/products/ingredientes')->assertOk()->assertJsonCount(0, 'ingredientes');
         Sanctum::actingAs(User::factory()->create(['rol' => 'CAJA']));
         $this->getJson('/api/users/roles')->assertForbidden();
         $this->getJson('/api/combos/productos')->assertForbidden();
         $this->getJson('/api/products/categorias')->assertForbidden();
+        $this->getJson('/api/products/ingredientes')->assertForbidden();
+
+        $productRole = Rol::factory()->create(['permisos' => $this->permissions('productos', ['crear'])]);
+        Sanctum::actingAs(User::factory()->create(['rol' => $productRole->nombre]));
+        $this->getJson('/api/products/ingredientes')->assertOk();
+        $this->getJson('/api/ingredients')->assertForbidden();
     }
 
     public function test_permission_matrix_rejects_unknown_missing_and_non_boolean_values(): void
@@ -255,6 +325,42 @@ class RoleManagementTest extends TestCase
         $product->update(['estado' => 'INACTIVO']);
         $this->patchJson('/api/products/'.$product->id_producto, ['nombre' => 'Producto corregido', 'estado' => 'INACTIVO'])
             ->assertOk()->assertJsonPath('producto.nombre', 'Producto corregido');
+    }
+
+    public function test_ingredient_status_requires_delete_permission_to_deactivate_and_edit_permission_to_activate(): void
+    {
+        $role = Rol::factory()->create(['permisos' => $this->permissions('ingredientes', ['eliminar'])]);
+        Sanctum::actingAs(User::factory()->create(['rol' => $role->nombre]));
+        $ingredient = Ingrediente::factory()->create(['estado' => 'ACTIVO']);
+
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", ['estado' => 'INACTIVO'])
+            ->assertOk()->assertJsonPath('ingrediente.estado', 'INACTIVO');
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", ['estado' => 'ACTIVO'])
+            ->assertForbidden();
+
+        $role->update(['permisos' => $this->permissions('ingredientes', ['editar'])]);
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", ['estado' => 'ACTIVO'])
+            ->assertOk()->assertJsonPath('ingrediente.estado', 'ACTIVO');
+        $this->patchJson("/api/ingredients/{$ingredient->id_ingrediente}/estado", ['estado' => 'INACTIVO'])
+            ->assertForbidden();
+    }
+
+    public function test_product_status_requires_delete_permission_to_deactivate_and_edit_permission_to_activate(): void
+    {
+        $role = Rol::factory()->create(['permisos' => $this->permissions('productos', ['eliminar'])]);
+        Sanctum::actingAs(User::factory()->create(['rol' => $role->nombre]));
+        $product = Producto::factory()->create(['estado' => 'ACTIVO']);
+
+        $this->patchJson("/api/products/{$product->id_producto}/estado", ['estado' => 'INACTIVO'])
+            ->assertOk()->assertJsonPath('producto.estado', 'INACTIVO');
+        $this->patchJson("/api/products/{$product->id_producto}/estado", ['estado' => 'ACTIVO'])
+            ->assertForbidden();
+
+        $role->update(['permisos' => $this->permissions('productos', ['editar'])]);
+        $this->patchJson("/api/products/{$product->id_producto}/estado", ['estado' => 'ACTIVO'])
+            ->assertOk()->assertJsonPath('producto.estado', 'ACTIVO');
+        $this->patchJson("/api/products/{$product->id_producto}/estado", ['estado' => 'INACTIVO'])
+            ->assertForbidden();
     }
 
     public function test_permissions_and_inactive_role_are_rechecked_on_next_request_in_same_session(): void

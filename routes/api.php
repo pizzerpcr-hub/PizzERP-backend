@@ -21,9 +21,14 @@ Route::middleware(['auth:sanctum', 'session.current'])->group(function (): void 
         Route::get('/user', [AuthController::class, 'user'])
             ->name('auth.user');
 
-        Route::get('/permissions', fn (Request $request) => response()->json([
-            'permisos' => $request->user()->modulePermissions(),
-        ]))->name('auth.permissions');
+        Route::get('/permissions', function (Request $request) {
+            $user = $request->user()->loadMissing('assignedRole');
+
+            return response()->json([
+                'permisos' => $user->modulePermissions(),
+                'rol_id' => $user->assignedRole?->getKey(),
+            ]);
+        })->name('auth.permissions');
 
         Route::get('/combos/productos', [ComboController::class, 'selectableProducts'])->name('combos.selectable-products');
         Route::apiResource('combos', ComboController::class)->only(['index', 'store', 'show', 'update'])->whereNumber('combo');
@@ -48,6 +53,8 @@ Route::middleware(['auth:sanctum', 'session.current'])->group(function (): void 
             [UserController::class, 'updateStatus']
         )->name('users.update-status');
 
+        Route::patch('/ingredients/{ingrediente}/estado', [IngredienteController::class, 'updateStatus'])
+            ->name('ingredients.update-status');
         Route::apiResource('ingredients', IngredienteController::class)
             ->parameters(['ingredients' => 'ingrediente']);
 
@@ -58,7 +65,10 @@ Route::middleware(['auth:sanctum', 'session.current'])->group(function (): void 
         Route::apiResource('products', ProductoController::class)
             ->only(['index', 'store', 'update'])
             ->parameters(['products' => 'producto']);
+        Route::patch('/products/{producto}/estado', [ProductoController::class, 'updateStatus'])
+            ->name('products.update-status');
 
         Route::get('/products/categorias', [ProductoController::class, 'selectableCategories'])->name('products.selectable-categories');
+        Route::get('/products/ingredientes', [ProductoController::class, 'selectableIngredients'])->name('products.selectable-ingredients');
     });
 });

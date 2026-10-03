@@ -31,4 +31,11 @@ class Combo extends Model
             ->withPivot('cantidad')
             ->orderBy('productos.id_producto');
     }
+
+    public function productosPromocionados(): BelongsToMany
+    {
+        return $this->belongsToMany(Producto::class, 'promocion_productos', 'id_promocion', 'id_producto')
+            ->withPivot('id_promocion_producto', 'cantidad')
+            ->orderBy('productos.id_producto');
+    }
 }
